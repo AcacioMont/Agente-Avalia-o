@@ -1,6 +1,6 @@
 import { PrismaClient } from '@prisma/client';
-import { calcularHashSnapshot, assertSnapshotCanBeCreated } from './safety-primitives.js';
-export { calcularHashSnapshot, snapshotIntegro } from './safety-primitives.js';
+import { calcularHashSnapshot, assertSnapshotCanBeCreated } from '../core/safety-primitives.js';
+export { calcularHashSnapshot, snapshotIntegro } from '../core/safety-primitives.js';
 
 const SNAPSHOT_SCHEMA_VERSION = 2;
 

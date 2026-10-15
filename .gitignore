@@ -34,3 +34,8 @@ AMBENTE.txt
 ARQUIVOS_CRITICOS.txt
 ESTRUTURA_PROJETO.txt
 AUDITORIA_LEITURA_*.txt
+reports/
+*.tsbuildinfo
+.vscode/
+*.bak_*
+*_Antigo.test.ts

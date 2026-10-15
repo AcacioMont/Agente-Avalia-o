@@ -13,18 +13,24 @@ import {
   TableRow,
   TableCell,
   WidthType,
-  BorderStyle
+  BorderStyle,
+  Footer,
+  PageNumber
 } from 'docx';
 import * as XLSX from 'xlsx';
 import { PrismaClient } from '@prisma/client';
 import { snapshotIntegro } from './SnapshotService.js';
 import { RuleEngine } from '../engines/RuleEngine.js';
-import { persistArtifactWithCompensation } from './safety-primitives.js';
+import { persistArtifactWithCompensation } from '../core/safety-primitives.js';
 
 type Dados = Record<string, any>;
 
 const root = path.resolve(process.cwd(), '../reports');
 fs.mkdirSync(root, { recursive: true });
+
+/* ------------------------------------------------------------------ */
+/* Formatadores                                                        */
+/* ------------------------------------------------------------------ */
 
 const arr = (v: unknown): Dados[] => Array.isArray(v) ? v : [];
 
@@ -63,23 +69,113 @@ const money = (v: unknown): string => {
 
 const dateBR = (v: unknown): string => {
   if (!v) return 'Não informado';
-
   const d = new Date(String(v));
-
-  return Number.isNaN(d.getTime())
-    ? txt(v)
-    : d.toLocaleDateString('pt-BR');
+  return Number.isNaN(d.getTime()) ? txt(v) : d.toLocaleDateString('pt-BR');
 };
 
 const dateTimeBR = (v: unknown): string => {
   if (!v) return 'Não informado';
-
   const d = new Date(String(v));
-
-  return Number.isNaN(d.getTime())
-    ? txt(v)
-    : d.toLocaleString('pt-BR');
+  return Number.isNaN(d.getTime()) ? txt(v) : d.toLocaleString('pt-BR');
 };
+
+/* ------------------------------------------------------------------ */
+/* Rótulos humanos (evita enum cru no laudo)                           */
+/* ------------------------------------------------------------------ */
+
+const L_STATUS: Record<string, string> = {
+  EM_ELABORACAO: 'Em elaboração',
+  CALCULADA: 'Calculada',
+  PRONTA_PARA_EMISSAO: 'Pronta para emissão'
+};
+const L_QUADRA: Record<string, string> = {
+  MEIO_QUADRA: 'Meio de quadra',
+  ESQUINA: 'Esquina',
+  MAIS_DE_UMA_FRENTE: 'Mais de uma frente'
+};
+const L_PADRAO: Record<string, string> = { BAIXO: 'Baixo', NORMAL: 'Normal', ALTO: 'Alto', LUXO: 'Luxo' };
+const L_CONS: Record<string, string> = {
+  REGULAR: 'Regular', NOVO: 'Novo', REPAROS_SIMPLES: 'Reparos simples',
+  BAIXO: 'Baixo', NORMAL: 'Normal', ALTO: 'Alto'
+};
+const L_TVAL: Record<string, string> = { OFERTA: 'Oferta', TRANSACAO: 'Transação' };
+const L_TFONTE: Record<string, string> = { MANUAL: 'Manual', PESQUISA_WEB: 'Pesquisa web' };
+const L_FINALIDADE: Record<string, string> = {
+  AVALIACAO: 'Avaliação imobiliária', COMPRA_VENDA: 'Compra e venda', LOCACAO: 'Locação',
+  GARANTIA: 'Garantia', JUDICIAL: 'Judicial', INVENTARIO: 'Inventário', OUTRA: 'Outra finalidade'
+};
+
+const lab = (map: Record<string, string>, v: unknown) =>
+  v === null || v === undefined || v === '' ? 'Não informado' : (map[String(v)] ?? String(v));
+
+function humanChave(codigo: string, chave: unknown): string {
+  const k = String(chave ?? '');
+  if (codigo === 'FELEV') return k === 'ELEVADOR' ? 'Com elevador' : k === 'SEM_ELEVADOR' ? 'Sem elevador' : k;
+  const mapas: Record<string, Record<string, string>> = { FE: L_QUADRA, FC: L_CONS, FPC: L_PADRAO, FO: L_TVAL };
+  return mapas[codigo]?.[k] ?? k;
+}
+
+/* ------------------------------------------------------------------ */
+/* Valor por extenso (pt-BR)                                           */
+/* ------------------------------------------------------------------ */
+
+const UN = ['', 'um', 'dois', 'três', 'quatro', 'cinco', 'seis', 'sete', 'oito', 'nove', 'dez',
+  'onze', 'doze', 'treze', 'quatorze', 'quinze', 'dezesseis', 'dezessete', 'dezoito', 'dezenove'];
+const DEZ = ['', '', 'vinte', 'trinta', 'quarenta', 'cinquenta', 'sessenta', 'setenta', 'oitenta', 'noventa'];
+const CEN = ['', 'cento', 'duzentos', 'trezentos', 'quatrocentos', 'quinhentos', 'seiscentos',
+  'setecentos', 'oitocentos', 'novecentos'];
+
+function extensoGrupo(n: number): string {
+  if (n === 0) return '';
+  const c = Math.floor(n / 100);
+  const rest = n % 100;
+  const partes: string[] = [];
+  if (c > 0) partes.push(n === 100 ? 'cem' : CEN[c]);
+  if (rest > 0) {
+    if (rest < 20) partes.push(UN[rest]);
+    else {
+      const d = Math.floor(rest / 10);
+      const u = rest % 10;
+      partes.push(u > 0 ? `${DEZ[d]} e ${UN[u]}` : DEZ[d]);
+    }
+  }
+  return partes.join(' e ');
+}
+
+function extensoInteiro(n: number): string {
+  if (n === 0) return 'zero';
+  const grupos: Array<[number, string, string]> = [
+    [Math.floor(n / 1000000000), 'bilhão', 'bilhões'],
+    [Math.floor(n / 1000000) % 1000, 'milhão', 'milhões'],
+    [Math.floor(n / 1000) % 1000, 'mil', 'mil'],
+    [n % 1000, '', '']
+  ];
+  const partes: string[] = [];
+  for (const [valor, sing, plur] of grupos) {
+    if (valor === 0) continue;
+    const g = extensoGrupo(valor);
+    partes.push(sing ? `${g} ${valor === 1 ? sing : plur}` : g);
+  }
+  if (partes.length === 1) return partes[0];
+  const ultima = partes[partes.length - 1];
+  const cauda = grupos[3][0];
+  const juncao = cauda > 0 && (cauda < 100 || cauda % 100 === 0) ? ' e ' : ', ';
+  return partes.slice(0, -1).join(', ') + juncao + ultima;
+}
+
+export function valorPorExtenso(v: unknown): string {
+  const n = num(v);
+  if (n === null) return 'Não informado';
+  const int = Math.floor(Math.abs(n));
+  const cen = Math.round((Math.abs(n) - int) * 100);
+  const partes: string[] = [`${extensoInteiro(int)} ${int === 1 ? 'real' : 'reais'}`];
+  if (cen > 0) partes.push(`${extensoInteiro(cen)} ${cen === 1 ? 'centavo' : 'centavos'}`);
+  return (n < 0 ? 'menos ' : '') + partes.join(' e ');
+}
+
+/* ------------------------------------------------------------------ */
+/* Snapshot: validação e normalização                                  */
+/* ------------------------------------------------------------------ */
 
 const latestResult = (data: Dados): Dados | undefined => {
   const xs = arr(data.resultados);
@@ -89,54 +185,25 @@ const latestResult = (data: Dados): Dados | undefined => {
 async function snap(prisma: PrismaClient, id: string) {
   const avaliacao = await prisma.avaliacao.findUnique({
     where: { id },
-    select: {
-      id: true,
-      status: true,
-      snapshotHash: true
-    }
+    select: { id: true, status: true, snapshotHash: true }
   });
 
-  if (!avaliacao) {
-    throw new Error('AVALIACAO_NOT_FOUND');
-  }
-
-  if (!avaliacao.snapshotHash) {
-    throw new Error('SNAPSHOT_HASH_AUSENTE');
-  }
+  if (!avaliacao) throw new Error('AVALIACAO_NOT_FOUND');
+  if (!avaliacao.snapshotHash) throw new Error('SNAPSHOT_HASH_AUSENTE');
 
   const s = await prisma.snapshot.findFirst({
-    where: {
-      avaliacaoId: id,
-      hashSha256: avaliacao.snapshotHash
-    },
+    where: { avaliacaoId: id, hashSha256: avaliacao.snapshotHash },
     orderBy: { versao: 'desc' }
   });
 
-  if (!s) {
-    throw new Error('SNAPSHOT_REQUIRED_BEFORE_EMISSION');
-  }
+  if (!s) throw new Error('SNAPSHOT_REQUIRED_BEFORE_EMISSION');
+  if (avaliacao.status !== 'PRONTA_PARA_EMISSAO') throw new Error('AVALIACAO_NAO_PRONTA_PARA_EMISSAO');
+  if (avaliacao.snapshotHash !== s.hashSha256) throw new Error('SNAPSHOT_NAO_VINCULADO_AO_ESTADO_ATUAL');
+  if (!snapshotIntegro(s)) throw new Error('SNAPSHOT_INTEGRO_INVALIDO');
 
-  if (avaliacao.status !== 'PRONTA_PARA_EMISSAO') {
-    throw new Error('AVALIACAO_NAO_PRONTA_PARA_EMISSAO');
-  }
-
-  if (!avaliacao.snapshotHash || avaliacao.snapshotHash !== s.hashSha256) {
-    throw new Error('SNAPSHOT_NAO_VINCULADO_AO_ESTADO_ATUAL');
-  }
-
-  if (!snapshotIntegro(s)) {
-    throw new Error('SNAPSHOT_INTEGRO_INVALIDO');
-  }
-
-  const readiness = await new RuleEngine(prisma).auditarAvaliacao(
-    id,
-    { exigirSnapshot: true }
-  );
-
+  const readiness = await new RuleEngine(prisma).auditarAvaliacao(id, { exigirSnapshot: true });
   if (!readiness.podeEmitir) {
-    throw new Error(
-      `AVALIACAO_NAO_APTA_PARA_EMISSAO:${JSON.stringify(readiness.alertas)}`
-    );
+    throw new Error(`AVALIACAO_NAO_APTA_PARA_EMISSAO:${JSON.stringify(readiness.alertas)}`);
   }
 
   const raw = JSON.parse(s.dadosJson) as Dados;
@@ -174,1338 +241,1002 @@ async function saveDocument(
   snapshotHash: string
 ) {
   const ext = formato.toLowerCase();
-
-  const stamp = new Date()
-    .toISOString()
-    .replace(/[-:.TZ]/g, '');
-
-  const nomeArquivo =
-    `laudo-${id}-${stamp}-${crypto.randomBytes(8).toString('hex')}.${ext}`;
-
+  const stamp = new Date().toISOString().replace(/[-:.TZ]/g, '');
+  const nomeArquivo = `laudo-${id}-${stamp}-${crypto.randomBytes(8).toString('hex')}.${ext}`;
   const caminho = path.join(root, nomeArquivo);
 
-  const hashSha256 = crypto
-    .createHash('sha256')
-    .update(buffer)
-    .digest('hex');
+  const hashSha256 = crypto.createHash('sha256').update(buffer).digest('hex');
 
   const saved = await persistArtifactWithCompensation({
     write: () => {
       fs.writeFileSync(caminho, buffer, { flag: 'wx' });
       return caminho;
     },
-
     persist: (arquivo: string) =>
       prisma.$transaction(async tx => {
         const doc = await tx.documento.create({
-          data: {
-            avaliacaoId: id,
-            tipo,
-            nomeArquivo,
-            caminho: arquivo,
-            formato,
-            hashSha256,
-            snapshotHash
-          }
+          data: { avaliacaoId: id, tipo, nomeArquivo, caminho, formato, hashSha256, snapshotHash }
         });
-
         await tx.auditoria.create({
           data: {
             avaliacaoId: id,
             acao: 'GERACAO_DOCUMENTO',
             entidade: 'Documento',
             entidadeId: doc.id,
-            depoisJson: JSON.stringify({
-              formato,
-              tipo,
-              nomeArquivo,
-              caminho: arquivo,
-              hashSha256,
-              snapshotHash
-            }),
+            depoisJson: JSON.stringify({ formato, tipo, nomeArquivo, caminho, hashSha256, snapshotHash }),
             usuario: 'sistema',
             motivo: 'Geração de documento a partir de snapshot congelado'
           }
         });
-
         return doc;
       }),
-
     remove: (arquivo: string) => fs.unlinkSync(arquivo)
   });
 
   return saved.record.caminho;
 }
 
+/* ------------------------------------------------------------------ */
+/* Modelo do laudo (blocos) — única fonte de verdade dos 3 formatos    */
+/* ------------------------------------------------------------------ */
 
-function allResultRows(d: Dados): Dados[] {
-  return arr(d.resultados).map((r, i) => ({
-    Ordem: i + 1,
-    ID: txt(r.id),
-    Método: txt(r.metodo),
-    NúmeroAmostras: r.numeroAmostras ?? null,
-    ValorUnitário: r.valorUnitario ?? null,
-    ÁreaReferência: r.areaReferencia ?? null,
-    ValorTotal: r.valorTotal ?? null,
-    Média: r.media ?? null,
-    Mediana: r.mediana ?? null,
-    DesvioPadrão: r.desvioPadrao ?? null,
-    CoeficienteVariação: r.coeficienteVariacao ?? null,
-    ErroPadrão: r.erroPadrao ?? null,
-    CriadoEm: dateTimeBR(r.createdAt)
-  }));
+export type Bloco =
+  | { t: 'h1'; x: string }
+  | { t: 'h2'; x: string }
+  | { t: 'p'; x: string }
+  | { t: 'bullets'; items: string[] }
+  | { t: 'kv'; rows: Array<[string, string]> }
+  | { t: 'grid'; cols: string[]; rows: string[][] };
+
+const T_STUDENT_80: Record<number, number> = {
+  1: 3.078, 2: 1.886, 3: 1.638, 4: 1.533, 5: 1.476,
+  6: 1.440, 7: 1.415, 8: 1.397, 9: 1.383, 10: 1.372
+};
+
+function intervaloConfianca80(r: Dados): string {
+  const n = num(r?.numeroAmostras) ?? 0;
+  const vu = num(r?.valorUnitario);
+  const ep = num(r?.erroPadrao);
+  if (!n || vu === null || ep === null || ep <= 0) return 'Não determinado (dados insuficientes)';
+  const t = T_STUDENT_80[n - 1] ?? 1.282;
+  const delta = t * ep;
+  return `${money(vu - delta)} a ${money(vu + delta)} (± ${money(delta)}, t de Student 80%, gl=${n - 1})`;
 }
 
-function historyRows(d: Dados): Dados[] {
-  return arr(d.historicos).map((h, i) => ({
-    Ordem: i + 1,
-    ID: txt(h.id),
-    Campo: txt(h.campo),
-    ValorAnterior: txt(h.valorAnterior),
-    ValorNovo: txt(h.valorNovo),
-    Usuário: txt(h.usuario),
-    Data: dateTimeBR(h.dataAlteracao),
-    Motivo: txt(h.motivo)
-  }));
+function chauvenetDetalhes(d: Dados): Dados[] {
+  try {
+    return JSON.parse(d.saneamento?.outliersChauvenetJson || '[]');
+  } catch {
+    return [];
+  }
 }
 
-function auditRows(d: Dados): Dados[] {
-  return arr(d.auditorias).map((a, i) => ({
-    Ordem: i + 1,
-    ID: txt(a.id),
-    Ação: txt(a.acao),
-    Entidade: txt(a.entidade),
-    EntidadeID: txt(a.entidadeId),
-    AntesJSON: txt(a.antesJson),
-    DepoisJSON: txt(a.depoisJson),
-    Usuário: txt(a.usuario),
-    Data: dateTimeBR(a.dataHora),
-    Motivo: txt(a.motivo)
-  }));
+function outlierDetalhes(d: Dados): Dados[] {
+  try {
+    return JSON.parse(d.saneamento?.outliersJson || '[]');
+  } catch {
+    return [];
+  }
 }
 
-function photoRows(d: Dados): Dados[] {
-  return arr(d.fotografias).map((f, i) => ({
-    Ordem: i + 1,
-    ID: txt(f.id),
-    AmostraID: txt(f.amostraId),
-    Arquivo: txt(f.arquivo),
-    Descrição: txt(f.descricao),
-    DataFoto: dateTimeBR(f.dataFoto),
-    OrdemOriginal: f.ordem ?? null
-  }));
-}
+/**
+ * Monta o laudo completo no arranjo da série ABNT NBR 14653
+ * (14653-1:2019 procedimentos gerais; 14653-2:2011 imóveis urbanos).
+ */
+export function montarLaudo(d: Dados, hash: string): Bloco[] {
+  const p: Dados = d.imovelAvaliando ?? {};
+  const r = latestResult(d);
+  const amostras = arr(d.amostras);
+  const ativas = amostras.filter(a => a.status === 'ATIVA');
+  const homs = arr(d.homogeneizacoes);
+  const san: Dados = d.saneamento ?? {};
+  const exclusoes = arr(d.exclusoes);
+  const fatores = arr(d.fatores);
+  const auditorias = arr(d.auditorias);
+  const chauv = chauvenetDetalhes(d);
+  const b: Bloco[] = [];
 
-function snapshotJsonRows(dadosJson: string): Dados[] {
-  const chunkSize = 30000;
-  const rows: Dados[] = [];
-  for (let i = 0, parte = 1; i < dadosJson.length; i += chunkSize, parte++) {
-    rows.push({
-      Parte: parte,
-      Inicio: i,
-      Fim: Math.min(i + chunkSize, dadosJson.length),
-      JSON: dadosJson.slice(i, i + chunkSize)
+  const endereco = [p.logradouro, p.numero, p.bairro].filter(x => x !== null && x !== undefined && x !== '').join(', ');
+
+  /* RESUMO EXECUTIVO ------------------------------------------------- */
+  b.push({ t: 'h1', x: 'RESUMO EXECUTIVO' });
+  b.push({
+    t: 'kv',
+    rows: [
+      ['Avaliação', `${txt(d.numero)} — ${txt(d.titulo)}`],
+      ['Finalidade', lab(L_FINALIDADE, d.finalidade)],
+      ['Imóvel avaliando', `${txt(d.tipoImovel)}${endereco ? ` — ${endereco}` : ''}, ${txt(d.municipio)}/${txt(d.estado)}`],
+      ['Data de referência da avaliação', dateBR(d.dataAvaliacao)],
+      ['Valor total estimado', r ? money(r.valorTotal) : 'Não determinado'],
+      ['Valor unitário estimado', r ? `${money(r.valorUnitario)} por m²` : 'Não determinado'],
+      ['Área de referência', r ? `${dec(r.areaReferencia)} m²` : 'Não informado'],
+      ['Método', r ? 'Comparativo de dados de mercado (média após saneamento)' : 'Não informado'],
+      ['Amostras utilizadas', r ? `${txt(r.numeroAmostras)} de ${ativas.length} ativas` : 'Não informado'],
+      ['Coeficiente de variação', r ? `${dec(Number(r.coeficienteVariacao) * 100, 2)}%` : 'Não informado'],
+      ['Intervalo de confiança (80%)', r ? intervaloConfianca80(r) : 'Não determinado'],
+      ['Especificação (graus)', 'Não determinada automaticamente pelo motor — ver seção 10'],
+      ['Rastreabilidade', `Snapshot SHA-256 ${hash.slice(0, 16)}… (seção 14)`]
+    ]
+  });
+  if (r) {
+    b.push({ t: 'p', x: `Valor total por extenso: ${valorPorExtenso(r.valorTotal)}.` });
+  }
+
+  /* 1. OBJETIVO ------------------------------------------------------ */
+  b.push({ t: 'h1', x: '1. OBJETIVO DA AVALIAÇÃO' });
+  b.push({
+    t: 'p',
+    x: `Determinar o valor de mercado do imóvel descrito na seção 4, para a finalidade de ${lab(L_FINALIDADE, d.finalidade).toLowerCase()}, ` +
+      `com data de referência de ${dateBR(d.dataAvaliacao)}, mediante o método comparativo de dados de mercado com homogeneização ` +
+      `de fatores e saneamento estatístico da amostra, conforme registrado neste laudo.`
+  });
+
+  /* 2. IDENTIFICAÇÃO ------------------------------------------------- */
+  b.push({ t: 'h1', x: '2. IDENTIFICAÇÃO DO SOLICITANTE E DO RESPONSÁVEL' });
+  b.push({
+    t: 'kv',
+    rows: [
+      ['Solicitante', 'Não informado (campo não coletado nesta versão do sistema)'],
+      ['Responsável pela avaliação', txt(d.responsavel)],
+      ['Registro profissional', 'A ser informado pelo profissional habilitado (CREA/CRECI/CAU etc.)'],
+      ['Equipe/colaboradores', 'Não informado']
+    ]
+  });
+  b.push({
+    t: 'p',
+    x: 'A revisão, a assinatura e a responsabilidade técnica deste trabalho cabem exclusivamente ao profissional habilitado. ' +
+      'Este laudo é um artefato técnico de apoio gerado automaticamente e não constitui, por si só, anuência profissional.'
+  });
+
+  /* 3. PRESSUPOSTOS -------------------------------------------------- */
+  b.push({ t: 'h1', x: '3. PRESSUPOSTOS, RESSALVAS E LIMITAÇÕES' });
+  b.push({
+    t: 'bullets',
+    items: [
+      'Os valores refletem as informações de mercado registradas nas amostras e o estado congelado (snapshot) da avaliação.',
+      'Campos não informados permanecem declarados como não informados; nenhum dado foi estimado por inferência automática.',
+      'Não foram considerados documentos, matrículas, certidões, restrições convencionais ou legais não constantes deste laudo.',
+      'A vistoria in loco, quando exigível, e a conferência documental são de responsabilidade do profissional habilitado.',
+      'O valor refere-se à data de referência informada; oscilações de mercado posteriores não estão refletidas.',
+      'Este laudo não constitui parecer jurídico, fiscal ou contábil.'
+    ]
+  });
+
+  /* 4. IMÓVEL -------------------------------------------------------- */
+  b.push({ t: 'h1', x: '4. DESCRIÇÃO E CARACTERIZAÇÃO DO IMÓVEL AVALIANDO' });
+  b.push({
+    t: 'kv',
+    rows: [
+      ['Tipo de imóvel', txt(d.tipoImovel)],
+      ['Endereço', endereco || 'Não informado'],
+      ['Município/UF', `${txt(d.municipio)}/${txt(d.estado)}`],
+      ['CEP', txt(p.cep)],
+      ['Matrícula', txt(p.matricula)],
+      ['Cadastro imobiliário', txt(p.cadastroImobiliario)],
+      ['Situação da quadra', lab(L_QUADRA, p.situacaoQuadra)],
+      ['Distância do centro', num(p.distanciaCentro) === null ? 'Não informado' : `${dec(p.distanciaCentro)} km`],
+      ['Área do terreno', num(p.areaTerreno) === null ? 'Não informado' : `${dec(p.areaTerreno)} m²`],
+      ['Testada principal', num(p.testadaPrincipal) === null ? 'Não informado' : `${dec(p.testadaPrincipal)} m`],
+      ['Profundidade informada', num(p.profundidadeInformada) === null ? 'Não informado' : `${dec(p.profundidadeInformada)} m`],
+      ['Profundidade utilizada', num(p.profundidadeUtilizada) === null ? 'Não informado' : `${dec(p.profundidadeUtilizada)} m`],
+      ['Área edificada privativa', num(p.areaEdificadaPrivativa) === null ? 'Não informado' : `${dec(p.areaEdificadaPrivativa)} m²`],
+      ['Área edificada total', num(p.areaEdificadaTotal) === null ? 'Não informado' : `${dec(p.areaEdificadaTotal)} m²`],
+      ['Padrão construtivo', lab(L_PADRAO, p.padrao)],
+      ['Estado de conservação', lab(L_CONS, p.conservacao)],
+      ['Idade', num(p.idade) === null ? 'Não informado' : `${dec(p.idade, 0)} anos`],
+      ['Vida útil', num(p.vidaUtil) === null ? 'Não informado' : `${dec(p.vidaUtil, 0)} anos`],
+      ['Elevador', txt(p.elevador)],
+      ['Vagas', num(p.numeroVagas) === null ? 'Não informado' : `${dec(p.numeroVagas, 0)} (${txt(p.tipoVaga)})`],
+      ['Observações', txt(p.observacoes)]
+    ]
+  });
+
+  /* 5. DADOS DE MERCADO ---------------------------------------------- */
+  b.push({ t: 'h1', x: '5. PESQUISA DE MERCADO E DADOS UTILIZADOS' });
+  b.push({
+    t: 'p',
+    x: `Foram coletados ${amostras.length} registros de mercado, dos quais ${ativas.length} permanecem ativos no cálculo. ` +
+      'As fontes, datas e características de cada registro estão na tabela a seguir e no Anexo A.'
+  });
+  b.push({
+    t: 'grid',
+    cols: ['Nº', 'Identificação', 'Fonte', 'Tipo', 'Coleta', 'Localização', 'Área (m²)', 'Valor (R$)', 'VU orig. (R$/m²)', 'Situação'],
+    rows: amostras.map((a, i) => {
+      const h = homs.find(x => x.amostraId === a.id);
+      return [
+        String(i + 1),
+        txt(a.identificador),
+        `${txt(a.fonte)} (${lab(L_TFONTE, a.tipoFonte)})`,
+        lab(L_TVAL, a.tipoValor),
+        dateBR(a.dataColeta),
+        `${txt(a.bairro)} — ${lab(L_QUADRA, a.situacaoQuadra)}`,
+        dec(a.areaTerreno),
+        dec(a.tipoValor === 'OFERTA' ? a.valorOferta : a.valorTransacao),
+        dec(h?.valorUnitarioOriginal),
+        a.status === 'ATIVA' ? 'Ativa' : 'Excluída do cálculo'
+      ];
+    })
+  });
+  if (exclusoes.length) {
+    b.push({ t: 'h2', x: '5.1 Exclusões formais da amostra' });
+    b.push({
+      t: 'grid',
+      cols: ['Nº', 'Amostra', 'Critério', 'Motivo', 'Valor', 'Responsável', 'Data'],
+      rows: exclusoes.map((e, i) => [
+        String(i + 1),
+        txt(e.amostra?.identificador ?? e.amostraId),
+        txt(e.criterio),
+        txt(e.motivo),
+        money(e.valor),
+        txt(e.usuario),
+        dateTimeBR(e.dataExclusao)
+      ])
+    });
+  } else {
+    b.push({ t: 'p', x: 'Nenhuma exclusão formal de amostra foi registrada até o congelamento do snapshot.' });
+  }
+
+  /* 6. METODOLOGIA ---------------------------------------------------- */
+  b.push({ t: 'h1', x: '6. METODOLOGIA E PROCEDIMENTOS' });
+  b.push({
+    t: 'p',
+    x: 'Adotou-se o método comparativo de dados de mercado, com homogeneização das amostras por fatores multiplicativos ' +
+      'referidos às características do imóvel avaliando, seguida de saneamento estatístico (critério de limites e critério de ' +
+      'Chauvenet) e estimação do valor unitário pela média aritmética dos valores unitários homogeneizados aprovados no saneamento. ' +
+      'O valor total resulta da aplicação do valor unitário à área de referência.'
+  });
+  b.push({ t: 'h2', x: '6.1 Fatores de homogeneização e fórmulas' });
+  b.push({
+    t: 'grid',
+    cols: ['Fator', 'Denominação', 'Fórmula/modelo'],
+    rows: fatores
+      .filter(f => f.codigo !== 'REGRAS')
+      .map(f => [txt(f.codigo), txt(f.nome), txt(f.formula)])
+  });
+  b.push({
+    t: 'kv',
+    rows: [
+      ['Versão do motor de cálculo', txt(d.versaoMotor)],
+      ['Hash dos parâmetros (SHA-256)', txt(d.parametrosHash)],
+      ['Tratamento estatístico', `Saneamento ${txt(san.metodo)} com critério de Chauvenet (seção 8)`]
+    ]
+  });
+
+  /* 7. HOMOGENEIZAÇÃO ------------------------------------------------- */
+  b.push({ t: 'h1', x: '7. HOMOGENEIZAÇÃO DOS DADOS DE MERCADO' });
+  b.push({
+    t: 'p',
+    x: 'Cada amostra teve seu valor unitário original multiplicado pelo produto dos fatores aplicáveis, ' +
+      'obtendo-se o valor unitário homogeneizado (VU homog.). Fatores iguais a 1,0000 indicam característica ' +
+      'idêntica à do imóvel avaliando ou fator não aplicável ao tipo de imóvel.'
+  });
+  b.push({
+    t: 'grid',
+    cols: ['Amostra', 'VU orig.', 'FA', 'FT', 'FP', 'FO', 'FE', 'FPC', 'FC', 'FElev', 'FG', 'FI', 'Produto', 'VU homog.'],
+    rows: homs.map(h => {
+      const a = amostras.find(x => x.id === h.amostraId);
+      return [
+        txt(a?.identificador ?? String(h.amostraId).slice(0, 8)),
+        dec(h.valorUnitarioOriginal),
+        dec(h.fa, 4), dec(h.ft, 4), dec(h.fp, 4), dec(h.fo, 4), dec(h.fe, 4),
+        dec(h.fpc, 4), dec(h.fc, 4), dec(h.felev, 4), dec(h.fg, 4), dec(h.fi, 4),
+        dec(h.produtoFatores, 4),
+        dec(h.valorUnitarioHomogeneizado)
+      ];
+    })
+  });
+  b.push({
+    t: 'p',
+    x: 'Legenda: FA área · FT testada · FP profundidade · FO oferta/transação · FE situação da quadra · ' +
+      'FPC padrão construtivo · FC conservação · FElev elevador · FG garagem · FI idade/depreciação.'
+  });
+
+  /* 8. SANEAMENTO ----------------------------------------------------- */
+  b.push({ t: 'h1', x: '8. SANEAMENTO E TRATAMENTO ESTATÍSTICO DOS DADOS' });
+  if (!d.saneamento) {
+    b.push({ t: 'p', x: 'Saneamento não registrado no snapshot.' });
+  } else {
+    b.push({
+      t: 'kv',
+      rows: [
+        ['Método de saneamento', txt(san.metodo)],
+        ['Média dos VU homogeneizados', dec(san.media, 4)],
+        ['Mediana', dec(san.mediana, 4)],
+        ['Desvio padrão', dec(san.desvioPadrao, 4)],
+        ['Coeficiente de variação', san.media ? `${dec((Number(san.desvioPadrao) / Number(san.media)) * 100, 2)}%` : 'Não informado'],
+        ['Limite inferior', dec(san.limiteInferior, 4)],
+        ['Limite superior', dec(san.limiteSuperior, 4)],
+        ['Critério de 30% sinalizado', san.criterio30 ? 'Sim' : 'Não'],
+        ['Critério de Chauvenet sinalizado', san.criterioChauvenet ? 'Sim' : 'Não'],
+        ['Data de execução', dateTimeBR(san.executadoEm)]
+      ]
+    });
+    if (chauv.length) {
+      b.push({ t: 'h2', x: '8.1 Valores sinalizados pelo critério de Chauvenet' });
+      b.push({
+        t: 'grid',
+        cols: ['Amostra', 'VU homog.', 'Desvio |z|', 'z crítico', 'Interpretação'],
+        rows: chauv.map(c => [
+          String((c.i ?? 0) + 1),
+          dec(c.v),
+          dec(c.z, 4),
+          dec(c.zCritico, 4),
+          Number(c.z) > Number(c.zCritico) ? 'Acima do limite de Chauvenet' : 'Dentro do limite'
+        ])
+      });
+      b.push({
+        t: 'kv',
+        rows: [
+          ['Decisão técnica registrada', san.decisaoChauvenet === 'MANTER_JUSTIFICADO' ? 'Manter as amostras, com justificativa' : san.decisaoChauvenet === 'EXCLUIR' ? 'Excluir as amostras sinalizadas' : 'Pendente'],
+          ['Justificativa técnica', txt(san.justificativaChauvenet)],
+          ['Responsável pela decisão', txt(san.decisaoChauvenetPor)],
+          ['Data da decisão', dateTimeBR(san.decisaoChauvenetEm)]
+        ]
+      });
+    } else {
+      b.push({ t: 'p', x: 'O critério de Chauvenet não sinalizou valores atípicos na amostra homogeneizada.' });
+    }
+    const outs = outlierDetalhes(d).filter(o => o.outlier);
+    if (outs.length) {
+      b.push({
+        t: 'p',
+        x: `Amostras fora dos limites do saneamento (critério de ${txt(san.metodo)}): ${outs.map(o => `nº ${(o.i ?? 0) + 1}`).join(', ')}.`
+      });
+    }
+  }
+
+  /* 9. RESULTADO ------------------------------------------------------ */
+  b.push({ t: 'h1', x: '9. CÁLCULO E RESULTADO DA AVALIAÇÃO' });
+  if (!r) {
+    b.push({ t: 'p', x: 'Não há resultado registrado no snapshot; não é possível apresentar conclusão de valor.' });
+  } else {
+    b.push({
+      t: 'kv',
+      rows: [
+        ['Método de estimação', 'Média aritmética dos VU homogeneizados aprovados no saneamento'],
+        ['Amostras aprovadas no cálculo', txt(r.numeroAmostras)],
+        ['Valor unitário estimado', `${money(r.valorUnitario)} por m²`],
+        ['Área de referência', `${dec(r.areaReferencia)} m²`],
+        ['VALOR TOTAL ESTIMADO', money(r.valorTotal)],
+        ['Valor total por extenso', valorPorExtenso(r.valorTotal)],
+        ['Média', dec(r.media, 4)],
+        ['Mediana', dec(r.mediana, 4)],
+        ['Desvio padrão', dec(r.desvioPadrao, 4)],
+        ['Coeficiente de variação', `${dec(Number(r.coeficienteVariacao) * 100, 2)}%`],
+        ['Erro padrão da média', dec(r.erroPadrao, 4)],
+        ['Intervalo de confiança (80%)', intervaloConfianca80(r)],
+        ['Data do cálculo', dateTimeBR(r.createdAt)]
+      ]
     });
   }
-  return rows;
+
+  /* 10. ESPECIFICAÇÃO -------------------------------------------------- */
+  b.push({ t: 'h1', x: '10. ESPECIFICAÇÃO DA AVALIAÇÃO (GRAUS)' });
+  b.push({
+    t: 'bullets',
+    items: [
+      'Normas de referência estrutural: ABNT NBR 14653-1:2019 e ABNT NBR 14653-2:2011, conforme aplicabilidade ao caso concreto.',
+      'Grau de fundamentação: não determinado automaticamente pelo motor nesta versão; a classificação exige a análise dos critérios normativos sobre a documentação e a pesquisa efetivamente utilizadas.',
+      'Grau de precisão: não declarado normativamente; o intervalo de confiança da seção 9 é apresentado como medida estatística de dispersão, sem equivalência automática aos graus da norma.',
+      'A classificação normativa final deve ser revisada e assumida pelo profissional responsável antes do uso externo do laudo.'
+    ]
+  });
+
+  /* 11. CONCLUSÃO ------------------------------------------------------ */
+  b.push({ t: 'h1', x: '11. CONCLUSÃO DE VALOR' });
+  b.push({
+    t: 'p',
+    x: r
+      ? `Diante do exposto, para a finalidade e a data de referência declaradas, o valor de mercado estimado do imóvel avaliando é de ` +
+        `${money(r.valorTotal)} (${valorPorExtenso(r.valorTotal)}), correspondente ao valor unitário de ${money(r.valorUnitario)} por m² ` +
+        `aplicado à área de referência de ${dec(r.areaReferencia)} m², obtido pelo método comparativo com ${txt(r.numeroAmostras)} amostras ` +
+        `aprovadas no saneamento estatístico.`
+      : 'Não há resultado válido registrado no snapshot; a conclusão de valor fica impossibilitada.'
+  });
+  b.push({
+    t: 'p',
+    x: 'A conclusão deve ser confirmada pelo profissional habilitado, que responderá tecnicamente pelo trabalho após revisão da documentação, da pesquisa e dos pressupostos aqui registrados.'
+  });
+
+  /* 12. ASSINATURA ------------------------------------------------------ */
+  b.push({ t: 'h1', x: '12. QUALIFICAÇÃO E ASSINATURA DO RESPONSÁVEL TÉCNICO' });
+  b.push({
+    t: 'kv',
+    rows: [
+      ['Responsável técnico', txt(d.responsavel)],
+      ['Registro profissional', '________________________________ (CREA/CRECI/CAU etc.)'],
+      ['Assinatura', '________________________________'],
+      ['Local e data', `${txt(d.municipio)}/${txt(d.estado)}, ${dateBR(new Date())}`]
+    ]
+  });
+
+  /* 13/14 handled below: anexos first, traceability last ---------------- */
+
+  /* ANEXO A ------------------------------------------------------------- */
+  b.push({ t: 'h1', x: 'ANEXO A — QUADRO COMPLETO DAS AMOSTRAS DE MERCADO' });
+  b.push({
+    t: 'grid',
+    cols: ['Nº', 'Identificação', 'Fonte/URL', 'Características', 'Valores', 'Observações'],
+    rows: amostras.map((a, i) => [
+      String(i + 1),
+      `${txt(a.identificador)}\n${txt(a.bairro)} — ${lab(L_QUADRA, a.situacaoQuadra)}`,
+      `${txt(a.fonte)} (${lab(L_TFONTE, a.tipoFonte)})\n${txt(a.url)}\nColeta: ${dateBR(a.dataColeta)}`,
+      `Área ${dec(a.areaTerreno)} m² · testada ${dec(a.testada)} m · prof. ${dec(a.profundidade)} m\n` +
+        `Padrão ${lab(L_PADRAO, a.padrao)} · conservação ${lab(L_CONS, a.conservacao)}\n` +
+        `Idade ${dec(a.idade, 0)} anos · vagas ${dec(a.numeroVagas, 0)} · elevador ${txt(a.elevador)}`,
+      `${lab(L_TVAL, a.tipoValor)}: ${money(a.tipoValor === 'OFERTA' ? a.valorOferta : a.valorTransacao)}\n` +
+        `VU original: ${money((() => { const h = homs.find(x => x.amostraId === a.id); return h?.valorUnitarioOriginal; })())}\n` +
+        `VU homog.: ${money((() => { const h = homs.find(x => x.amostraId === a.id); return h?.valorUnitarioHomogeneizado; })())}`,
+      txt(a.observacoes)
+    ])
+  });
+
+  /* ANEXO B ------------------------------------------------------------- */
+  b.push({ t: 'h1', x: 'ANEXO B — PARÂMETROS E FATORES CONGELADOS NO SNAPSHOT' });
+  b.push({
+    t: 'grid',
+    cols: ['Fator', 'Denominação', 'Parâmetro', 'Valor', 'Unidade', 'Justificativa'],
+    rows: fatores.flatMap(f =>
+      arr(f.parametros).length
+        ? arr(f.parametros).map(pp => [txt(f.codigo), txt(f.nome), humanChave(f.codigo, pp.chave), dec(pp.valor, 8), txt(pp.unidade), txt(pp.justificativa)])
+        : [[txt(f.codigo), txt(f.nome), 'Nenhum parâmetro ativo', '—', '—', '—']]
+    )
+  });
+
+  /* ANEXO C ------------------------------------------------------------- */
+  b.push({ t: 'h1', x: 'ANEXO C — TRILHA DE AUDITORIA CONGELADA' });
+  b.push({
+    t: 'grid',
+    cols: ['Data/hora', 'Ação', 'Entidade', 'Responsável', 'Motivo/registro'],
+    rows: auditorias.map(a => [
+      dateTimeBR(a.dataHora),
+      txt(a.acao),
+      txt(a.entidade),
+      txt(a.usuario),
+      txt(a.motivo)
+    ])
+  });
+
+  /* 14. RASTREABILIDADE -------------------------------------------------- */
+  b.push({ t: 'h1', x: '14. RASTREABILIDADE, INTEGRIDADE E RESPONSABILIDADE' });
+  b.push({
+    t: 'kv',
+    rows: [
+      ['Identificador da avaliação', txt(d.id)],
+      ['Snapshot SHA-256', hash],
+      ['Versão da estrutura do snapshot', txt(d.snapshotSchemaVersion)],
+      ['Data/hora do congelamento', dateTimeBR(d.congeladoEm)],
+      ['Estado técnico ao congelamento', lab(L_STATUS, d.status)],
+      ['Versão do motor', txt(d.versaoMotor)],
+      ['Hash dos parâmetros', txt(d.parametrosHash)],
+      ['Registros congelados', `${amostras.length} amostras · ${homs.length} homogeneizações · ${exclusoes.length} exclusões · ${auditorias.length} auditorias · ${arr(d.fotografias).length} fotografias`],
+      ['Data/hora de geração deste arquivo', dateTimeBR(new Date())]
+    ]
+  });
+  b.push({
+    t: 'p',
+    x: 'Este documento foi estruturado para apoiar a apresentação de avaliação de imóvel urbano nos moldes da ABNT NBR 14653-1:2019 ' +
+      'e da ABNT NBR 14653-2:2011. A conformidade integral não é declarada automaticamente: depende do caso concreto, da documentação, ' +
+      'da metodologia efetivamente aplicável, da especificação alcançada e da revisão e responsabilidade do profissional habilitado. ' +
+      'O conteúdo técnico reproduzido aqui é o estado congelado validado pelo SHA-256 acima; o JSON integral do snapshot permanece ' +
+      'disponível na planilha XLSX (aba Snapshot_JSON) e no banco de dados do sistema.'
+  });
+
+  return b;
 }
 
-function generalRows(d: Dados): Dados[] {
-  return [
-    ['Número da avaliação', d.numero],
-    ['Título', d.titulo],
-    ['Finalidade', d.finalidade],
-    ['Tipo de imóvel', d.tipoImovel],
-    ['Município', d.municipio],
-    ['Estado', d.estado],
-    ['Data da avaliação', dateBR(d.dataAvaliacao)],
-    ['Responsável', d.responsavel],
-    ['Status no snapshot', d.status],
-    ['Versão do motor', d.versaoMotor],
-    ['Hash dos parâmetros', d.parametrosHash],
-    ['Identificador interno', d.id]
-  ].map(([Campo, Valor]) => ({
-    Campo,
-    Valor: txt(Valor)
-  }));
-}
-
-function propertyRows(p: Dados): Dados[] {
-  const labels: Record<string, string> = {
-    matricula: 'Matrícula',
-    cadastroImobiliario: 'Cadastro imobiliário',
-    logradouro: 'Logradouro',
-    numero: 'Número',
-    complemento: 'Complemento',
-    bairro: 'Bairro',
-    cep: 'CEP',
-    areaTerreno: 'Área do terreno (m²)',
-    testadaPrincipal: 'Testada principal (m)',
-    profundidadeInformada: 'Profundidade informada (m)',
-    profundidadeCalculada: 'Profundidade calculada (m)',
-    profundidadeUtilizada: 'Profundidade utilizada (m)',
-    situacaoQuadra: 'Situação da quadra',
-    distanciaCentro: 'Distância do centro',
-    areaEdificadaPrivativa: 'Área edificada privativa (m²)',
-    areaEdificadaTotal: 'Área edificada total (m²)',
-    padrao: 'Padrão construtivo',
-    conservacao: 'Estado de conservação',
-    idade: 'Idade (anos)',
-    vidaUtil: 'Vida útil',
-    elevador: 'Possui elevador',
-    numeroVagas: 'Número de vagas',
-    tipoVaga: 'Tipo de vaga',
-    valorTotal: 'Valor total informado',
-    observacoes: 'Observações'
+function capaBloco(d: Dados, hash: string): { titulo: string; linhas: string[] } {
+  const p: Dados = d.imovelAvaliando ?? {};
+  const endereco = [p.logradouro, p.numero, p.bairro].filter(x => x !== null && x !== undefined && x !== '').join(', ');
+  return {
+    titulo: 'LAUDO DE AVALIAÇÃO DE IMÓVEL',
+    linhas: [
+      `${txt(d.numero)} — ${txt(d.titulo)}`,
+      lab(L_FINALIDADE, d.finalidade),
+      `${txt(d.tipoImovel)}${endereco ? ` — ${endereco}` : ''}`,
+      `${txt(d.municipio)}/${txt(d.estado)}`,
+      `Data de referência: ${dateBR(d.dataAvaliacao)}`,
+      `Responsável: ${txt(d.responsavel)}`,
+      `Motor de cálculo v${txt(d.versaoMotor)}`,
+      `Snapshot SHA-256: ${hash.slice(0, 24)}…`,
+      `Emitido em ${dateTimeBR(new Date())}`
+    ]
   };
-
-  return Object.entries(labels).map(([key, label]) => ({
-    Campo: label,
-    Valor:
-      key === 'valorTotal'
-        ? money(p?.[key])
-        : txt(p?.[key])
-  }));
 }
 
-function sampleRows(d: Dados): Dados[] {
-  const homs = arr(d.homogeneizacoes);
-  const samples = arr(d.amostras);
+/* ------------------------------------------------------------------ */
+/* Renderizador PDF                                                    */
+/* ------------------------------------------------------------------ */
 
-  return samples.map((a, i) => {
-    const h = homs.find(x => x.amostraId === a.id);
+const PDF_X = 55;
+const PDF_W = 485;
 
-    return {
-      Ordem: i + 1,
-      Identificador: txt(a.identificador),
-      Fonte: txt(a.fonte),
-      URL: txt(a.url),
-      DataColeta: dateBR(a.dataColeta),
-      TipoFonte: txt(a.tipoFonte),
-      Bairro: txt(a.bairro),
-      SituacaoQuadra: txt(a.situacaoQuadra),
-      AreaTerreno_m2: a.areaTerreno ?? null,
-      Testada_m: a.testada ?? null,
-      Profundidade_m: a.profundidade ?? null,
-      AreaEdificada_m2: a.areaEdificada ?? null,
-      AreaPrivativa_m2: a.areaPrivativa ?? null,
-      Padrao: txt(a.padrao),
-      Conservacao: txt(a.conservacao),
-      Idade: a.idade ?? null,
-      VidaUtil: a.vidaUtil ?? null,
-      Elevador: txt(a.elevador),
-      Vagas: a.numeroVagas ?? null,
-      DistanciaCentro: a.distanciaCentro ?? null,
-      ValorOferta: a.valorOferta ?? null,
-      ValorTransacao: a.valorTransacao ?? null,
-      TipoValor: txt(a.tipoValor),
-      Status: txt(a.status),
-      Observacoes: txt(a.observacoes),
-      ValorUnitarioOriginal: h?.valorUnitarioOriginal ?? null,
-      ValorUnitarioHomogeneizado:
-        h?.valorUnitarioHomogeneizado ?? null
-    };
-  });
+function pdfKV(doc: PDFKit.PDFDocument, rows: Array<[string, string]>) {
+  const col1 = 175;
+  const col2 = PDF_W - col1;
+  for (const [campo, valor] of rows) {
+    const startY = doc.y;
+    const hCampo = doc.font('Helvetica-Bold').fontSize(8.5).heightOfString(campo, { width: col1 });
+    const hValor = doc.font('Helvetica').fontSize(8.5).heightOfString(valor, { width: col2 });
+    const rowH = Math.max(hCampo, hValor) + 6;
+    if (startY + rowH > doc.page.height - doc.page.margins.bottom) doc.addPage();
+    const y = doc.y;
+    doc.font('Helvetica-Bold').fontSize(8.5).text(campo, PDF_X, y, { width: col1 });
+    doc.font('Helvetica').fontSize(8.5).text(valor, PDF_X + col1, y, { width: col2 });
+    doc.y = y + rowH;
+    doc.moveTo(PDF_X, doc.y - 2).lineTo(PDF_X + PDF_W, doc.y - 2).strokeColor('#CCCCCC').stroke();
+  }
+  doc.x = PDF_X;
+  doc.moveDown(0.4);
 }
 
-function homRows(d: Dados): Dados[] {
-  const samples = arr(d.amostras);
-
-  return arr(d.homogeneizacoes).map((h, i) => {
-    const a = samples.find(x => x.id === h.amostraId);
-
-    return {
-      Ordem: i + 1,
-      Amostra: txt(a?.identificador ?? h.amostraId),
-      Bairro: txt(a?.bairro),
-      ValorUnitarioOriginal: h.valorUnitarioOriginal,
-      FA: h.fa,
-      FT: h.ft,
-      FP: h.fp,
-      FO: h.fo,
-      FE: h.fe,
-      FI: h.fi,
-      FPC: h.fpc,
-      FC: h.fc,
-      FELEV: h.felev,
-      FG: h.fg,
-      ProdutoFatores: h.produtoFatores,
-      ValorUnitarioHomogeneizado:
-        h.valorUnitarioHomogeneizado,
-      MotorVersao: txt(h.motorVersao),
-      ParametrosHash: txt(h.parametrosHash),
-      CalculadoEm: dateBR(h.calculadoEm),
-      AuditoriaCalculo: txt(h.auditoriaJson)
-    };
-  });
+function pdfGrid(doc: PDFKit.PDFDocument, cols: string[], rows: string[][]) {
+  const fontSize = cols.length > 8 ? 6.8 : cols.length > 6 ? 7.4 : 8;
+  const pad = 3;
+  const widths = cols.map(() => PDF_W / cols.length);
+  const drawRow = (cells: string[], bold: boolean, fill?: string) => {
+    doc.font(bold ? 'Helvetica-Bold' : 'Helvetica').fontSize(fontSize);
+    const heights = cells.map((c, i) => doc.heightOfString(c, { width: widths[i] - pad * 2 }));
+    const rowH = Math.max(doc.currentLineHeight(), ...heights) + pad * 2;
+    if (doc.y + rowH > doc.page.height - doc.page.margins.bottom) {
+      doc.addPage();
+      doc.font('Helvetica-Bold').fontSize(fontSize);
+      const y0 = doc.y;
+      let cx = PDF_X;
+      cols.forEach((c, i) => { doc.text(c, cx + pad, y0 + pad, { width: widths[i] - pad * 2 }); cx += widths[i]; });
+      doc.y = y0 + rowH;
+      doc.moveTo(PDF_X, y0).lineTo(PDF_X + PDF_W, y0).strokeColor('#999999').stroke();
+    }
+    const y = doc.y;
+    if (fill) doc.rect(PDF_X, y, PDF_W, rowH).fill(fill);
+    doc.font(bold ? 'Helvetica-Bold' : 'Helvetica').fontSize(fontSize);
+    let cx = PDF_X;
+    cells.forEach((c, i) => { doc.text(c, cx + pad, y + pad, { width: widths[i] - pad * 2 }); cx += widths[i]; });
+    doc.y = y + rowH;
+    let bx = PDF_X;
+    for (let i = 0; i <= cols.length; i++) {
+      doc.moveTo(bx, y).lineTo(bx, y + rowH).strokeColor('#CCCCCC').stroke();
+      bx += widths[i] ?? 0;
+    }
+    doc.moveTo(PDF_X, y + rowH).lineTo(PDF_X + PDF_W, y + rowH).strokeColor('#CCCCCC').stroke();
+  };
+  drawRow(cols, true, '#EEEEEE');
+  for (const row of rows) drawRow(row, false);
+  doc.x = PDF_X;
+  doc.moveDown(0.5);
 }
 
-function resultRows(d: Dados): Dados[] {
-  const r = latestResult(d);
+function renderPDF(d: Dados, hash: string): Promise<Buffer> {
+  const blocos = montarLaudo(d, hash);
+  const capa = capaBloco(d, hash);
 
-  if (!r) {
-    return [
-      {
-        Campo: 'Resultado',
-        Valor: 'Não registrado no snapshot'
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    const doc = new PDFDocument({
+      size: 'A4',
+      margins: { top: 60, bottom: 84, left: PDF_X, right: PDF_X },
+      bufferPages: true,
+      info: {
+        Title: `Laudo de avaliação ${txt(d.numero)}`,
+        Author: txt(d.responsavel),
+        Subject: 'Laudo de avaliação de imóvel — método comparativo (ABNT NBR 14653)',
+        Keywords: `RoboAvaliador, ${hash}`
       }
-    ];
-  }
+    });
 
-  return [
-    { Campo: 'Método', Valor: txt(r.metodo) },
-    {
-      Campo: 'Número de amostras',
-      Valor: txt(r.numeroAmostras)
-    },
-    {
-      Campo: 'Valor unitário estimado',
-      Valor: money(r.valorUnitario)
-    },
-    {
-      Campo: 'Área de referência (m²)',
-      Valor: dec(r.areaReferencia)
-    },
-    {
-      Campo: 'Valor total estimado',
-      Valor: money(r.valorTotal)
-    },
-    {
-      Campo: 'Média',
-      Valor: money(r.media)
-    },
-    {
-      Campo: 'Mediana',
-      Valor: money(r.mediana)
-    },
-    {
-      Campo: 'Desvio padrão',
-      Valor: dec(r.desvioPadrao, 4)
-    },
-    {
-      Campo: 'Coeficiente de variação',
-      Valor: dec(r.coeficienteVariacao, 4)
-    },
-    {
-      Campo: 'Erro padrão',
-      Valor: dec(r.erroPadrao, 4)
-    },
-    {
-      Campo: 'Data do resultado',
-      Valor: dateBR(r.createdAt)
+    doc.on('data', (c: Buffer) => chunks.push(c));
+    doc.on('error', reject);
+    doc.on('end', () => resolve(Buffer.concat(chunks)));
+
+    /* capa */
+    doc.moveDown(6);
+    doc.font('Helvetica-Bold').fontSize(21).fillColor('#111111').text(capa.titulo, PDF_X, doc.y, { width: PDF_W, align: 'center' });
+    doc.moveDown(0.6);
+    doc.font('Helvetica').fontSize(11).fillColor('#333333');
+    for (const linha of capa.linhas) {
+      doc.text(linha, PDF_X, doc.y, { width: PDF_W, align: 'center' });
+      doc.moveDown(0.25);
     }
-  ];
-}
+    doc.moveDown(2);
+    doc.font('Helvetica-Oblique').fontSize(9).fillColor('#555555')
+      .text('Relatório técnico gerado automaticamente a partir de snapshot congelado e íntegro. ' +
+        'Sujeito a revisão e responsabilidade do profissional habilitado.', PDF_X, doc.y, { width: PDF_W, align: 'center' });
+    doc.addPage();
+    doc.fillColor('#111111');
 
-function sanitationRows(d: Dados): Dados[] {
-  const s = d.saneamento;
-
-  if (!s) {
-    return [
-      {
-        Campo: 'Saneamento',
-        Valor: 'Não registrado no snapshot'
+    /* corpo */
+    for (const bl of blocos) {
+      if (bl.t === 'h1') {
+        if (doc.y > doc.page.height - 160) doc.addPage();
+        doc.font('Helvetica-Bold').fontSize(12).fillColor('#111111').text(bl.x, PDF_X, doc.y, { width: PDF_W });
+        doc.moveDown(0.35);
+      } else if (bl.t === 'h2') {
+        doc.font('Helvetica-Bold').fontSize(10).fillColor('#222222').text(bl.x, PDF_X, doc.y, { width: PDF_W });
+        doc.moveDown(0.25);
+      } else if (bl.t === 'p') {
+        doc.font('Helvetica').fontSize(9.5).fillColor('#111111').text(bl.x, PDF_X, doc.y, { width: PDF_W, align: 'justify', lineGap: 1.5 });
+        doc.moveDown(0.45);
+      } else if (bl.t === 'bullets') {
+        doc.font('Helvetica').fontSize(9.5).fillColor('#111111');
+        for (const item of bl.items) {
+          doc.text(`•  ${item}`, PDF_X + 6, doc.y, { width: PDF_W - 6, lineGap: 1 });
+          doc.moveDown(0.15);
+        }
+        doc.moveDown(0.4);
+      } else if (bl.t === 'kv') {
+        pdfKV(doc, bl.rows);
+      } else if (bl.t === 'grid') {
+        pdfGrid(doc, bl.cols, bl.rows);
       }
-    ];
-  }
-
-  return [
-    ['Método', s.metodo],
-    ['Média', dec(s.media, 4)],
-    ['Mediana', dec(s.mediana, 4)],
-    ['Desvio padrão', dec(s.desvioPadrao, 4)],
-    ['Limite inferior', dec(s.limiteInferior, 4)],
-    ['Limite superior', dec(s.limiteSuperior, 4)],
-    ['Critério de Chauvenet', s.criterioChauvenet],
-    ['Decisão técnica Chauvenet', s.decisaoChauvenet ?? 'PENDENTE'],
-    ['Justificativa Chauvenet', s.justificativaChauvenet],
-    ['Responsável pela decisão Chauvenet', s.decisaoChauvenetPor],
-    ['Data da decisão Chauvenet', dateTimeBR(s.decisaoChauvenetEm)],
-    ['Amostras sinalizadas por Chauvenet', s.outliersChauvenetJson],
-    ['Critério de 30%', s.criterio30],
-    ['Outliers registrados', s.outliersJson],
-    ['Data de execução', dateBR(s.executadoEm)]
-  ].map(([Campo, Valor]) => ({
-    Campo,
-    Valor: txt(Valor)
-  }));
-}
-
-function exclusionRows(d: Dados): Dados[] {
-  const exclusions = arr(d.exclusoes);
-
-  if (!exclusions.length) {
-    return [{
-      Campo: 'Exclusões formais',
-      Valor: 'Nenhuma exclusão formal registrada no snapshot'
-    }];
-  }
-
-  return exclusions.map((e, i) => ({
-    Ordem: i + 1,
-    Amostra: txt(e.amostra?.identificador ?? e.amostraId),
-    Critério: txt(e.criterio),
-    Motivo: txt(e.motivo),
-    Valor: money(e.valor),
-    Usuário: txt(e.usuario),
-    Data: dateTimeBR(e.dataExclusao),
-    StatusAmostra: txt(e.amostra?.status)
-  }));
-}
-
-function factorRows(d: Dados): Array<Record<string, string | undefined>> {
-  const factors = arr(d.fatores);
-
-  if (!factors.length) {
-    return [{
-      Fator: 'Parâmetros',
-      Valor: 'Parâmetros detalhados não registrados no snapshot'
-    }];
-  }
-
-  return factors.flatMap((f): Dados[] => {
-    const params = arr(f.parametros);
-
-    if (!params.length) {
-      return [{
-        Fator: txt(f.codigo),
-        Nome: txt(f.nome),
-        Fórmula: txt(f.formula),
-        Parâmetro: 'Nenhum parâmetro ativo'
-      }];
+      doc.x = PDF_X;
     }
 
-    return params.map((p) => ({
-      Fator: txt(f.codigo),
-      Nome: txt(f.nome),
-      Fórmula: txt(f.formula),
-      Chave: txt(p.chave),
-      Valor: dec(p.valor, 8),
-      Unidade: txt(p.unidade),
-      Justificativa: txt(p.justificativa)
-    }));
-  });
-}
-
-function governanceRows(d: Dados, hash: string): Dados[] {
-  return [
-    { Campo: 'Versão da estrutura do snapshot', Valor: txt(d.snapshotSchemaVersion) },
-    { Campo: 'Versão do motor', Valor: txt(d.versaoMotor) },
-    { Campo: 'Hash dos parâmetros', Valor: txt(d.parametrosHash) },
-    { Campo: 'Snapshot SHA-256', Valor: hash },
-    { Campo: 'Data/hora do congelamento', Valor: dateTimeBR(d.congeladoEm) },
-    { Campo: 'Status congelado', Valor: txt(d.status) },
-    { Campo: 'Exclusões formais registradas', Valor: String(arr(d.exclusoes).length) },
-    { Campo: 'Fotografias/metadata registrados', Valor: String(arr(d.fotografias).length) },
-    { Campo: 'Registros de histórico congelados', Valor: String(arr(d.historicos).length) },
-    { Campo: 'Auditorias congeladas', Valor: String(arr(d.auditorias).length) }
-  ];
-}
-
-function reportSections(
-  d: Dados,
-  hash: string
-): { title: string; rows?: Dados[]; lines?: string[] }[] {
-  const p = d.imovelAvaliando ?? {};
-  const r = latestResult(d);
-  const samples = arr(d.amostras);
-  const homs = arr(d.homogeneizacoes);
-
-  const sampleLines: string[] = [
-    `Quantidade de registros no snapshot: ${samples.length}`
-  ];
-
-  samples.forEach((a, i) => {
-    const h = homs.find(x => x.amostraId === a.id);
-
-    sampleLines.push(
-      `Amostra ${i + 1} — ${txt(a.identificador)}`
-    );
-
-    sampleLines.push(
-      `Fonte: ${txt(a.fonte)} | URL: ${txt(a.url)} | Coleta: ${dateBR(a.dataColeta)} | Status: ${txt(a.status)}`
-    );
-
-    sampleLines.push(
-      `Localização: ${txt(a.bairro)} | Situação da quadra: ${txt(a.situacaoQuadra)}`
-    );
-
-    sampleLines.push(
-      `Terreno: ${dec(a.areaTerreno)} m² | Testada: ${dec(a.testada)} m | Profundidade: ${dec(a.profundidade)} m | Área edificada: ${dec(a.areaEdificada)} m² | Área privativa: ${dec(a.areaPrivativa)} m²`
-    );
-
-    sampleLines.push(
-      `Oferta: ${money(a.valorOferta)} | Transação: ${money(a.valorTransacao)} | Tipo de valor: ${txt(a.tipoValor)} | Valor unitário homogeneizado: ${money(h?.valorUnitarioHomogeneizado)}`
-    );
-
-    sampleLines.push(
-      `Características: padrão ${txt(a.padrao)}; conservação ${txt(a.conservacao)}; idade ${txt(a.idade)}; vagas ${txt(a.numeroVagas)}; distância do centro ${txt(a.distanciaCentro)}. Observações: ${txt(a.observacoes)}`
-    );
-  });
-
-  const homLines: string[] = [
-    `Quantidade de registros: ${homs.length}`
-  ];
-
-  homs.forEach(h => {
-    const a = samples.find(x => x.id === h.amostraId);
-
-    homLines.push(
-      `Amostra: ${txt(a?.identificador ?? h.amostraId)} | VU original: ${money(h.valorUnitarioOriginal)} | VU homogeneizado: ${money(h.valorUnitarioHomogeneizado)}`
-    );
-
-    homLines.push(
-      `Fatores: FA=${txt(h.fa)}; FT=${txt(h.ft)}; FP=${txt(h.fp)}; FO=${txt(h.fo)}; FE=${txt(h.fe)}; FI=${txt(h.fi)}; FPC=${txt(h.fpc)}; FC=${txt(h.fc)}; FELEV=${txt(h.felev)}; FG=${txt(h.fg)}; Produto=${txt(h.produtoFatores)}`
-    );
-
-    homLines.push(
-      `Motor: ${txt(h.motorVersao)} | Hash parâmetros: ${txt(h.parametrosHash)} | Calculado em: ${dateBR(h.calculadoEm)}`
-    );
-  });
-
-  const resultLines = r
-    ? [
-        `Método declarado: ${txt(r.metodo)}`,
-        `Número de amostras: ${txt(r.numeroAmostras)}`,
-        `Valor unitário estimado: ${money(r.valorUnitario)}`,
-        `Área de referência: ${dec(r.areaReferencia)} m²`,
-        `Valor total estimado: ${money(r.valorTotal)}`,
-        `Média: ${money(r.media)} | Mediana: ${money(r.mediana)}`,
-        `Desvio padrão: ${dec(r.desvioPadrao, 4)} | Coeficiente de variação: ${dec(r.coeficienteVariacao, 4)} | Erro padrão: ${dec(r.erroPadrao, 4)}`,
-        `Data do resultado: ${dateBR(r.createdAt)}`
-      ]
-    : ['Não há resultado registrado no snapshot.'];
-
-  return [
-    {
-      title: '1. IDENTIFICAÇÃO DA AVALIAÇÃO',
-      rows: generalRows(d)
-    },
-    {
-      title: '2. OBJETO, FINALIDADE E IDENTIFICAÇÃO DO IMÓVEL',
-      rows: propertyRows(p)
-    },
-    {
-      title: '3. PRESSUPOSTOS, RESSALVAS E LIMITAÇÕES',
-      lines: [
-        'Este relatório reproduz os dados disponíveis no snapshot congelado.',
-        'Campos ausentes são identificados como não informados e não foram preenchidos por estimativa automática.',
-        'A validade técnica depende da conferência dos documentos, da vistoria quando aplicável, da adequação da amostra, dos pressupostos do método e da revisão e responsabilidade do profissional habilitado.',
-        'Não foram inferidos fatos, documentos, condições físicas ou características não presentes no snapshot.'
-      ]
-    },
-    {
-      title: '4. METODOLOGIA E PROCEDIMENTOS',
-      lines: [
-        `Método registrado no resultado: ${txt(r?.metodo)}`,
-        `Versão do motor: ${txt(d.versaoMotor)}`,
-        `Hash dos parâmetros: ${txt(d.parametrosHash)}`,
-        'A metodologia descrita nesta seção limita-se ao método e aos fatores efetivamente registrados no snapshot. A escolha e justificativa técnica final devem ser validadas pelo responsável técnico.'
-      ]
-    },
-    {
-      title: '5. PESQUISA DE MERCADO E AMOSTRAS',
-      lines: sampleLines
-    },
-    {
-      title: '6. HOMOGENEIZAÇÃO E FATORES',
-      lines: homLines
-    },
-    {
-      title: '7. SANEAMENTO E TRATAMENTO DOS DADOS',
-      rows: sanitationRows(d)
-    },
-    {
-      title: '8. ANÁLISE ESTATÍSTICA E RESULTADO',
-      lines: resultLines
-    },
-    {
-      title: '9. EXCLUSÕES E DECISÕES DE SANEAMENTO',
-      rows: exclusionRows(d)
-    },
-    {
-      title: '10. PARÂMETROS E FATORES REGISTRADOS',
-      rows: factorRows(d)
-    },
-    {
-      title: '11. ESPECIFICAÇÃO DA AVALIAÇÃO',
-      lines: [
-        'Norma de referência estrutural: ABNT NBR 14653-1:2019 e ABNT NBR 14653-2:2011, conforme aplicabilidade ao caso concreto.',
-        'Método e tratamento utilizados: somente os efetivamente registrados no snapshot.',
-        'Grau de fundamentação: não determinado automaticamente pelo motor nesta versão; não deve ser inferido a partir de dados insuficientes.',
-        'Grau de precisão: não determinado automaticamente pelo motor nesta versão; não deve ser apresentado como grau normativo sem os cálculos e requisitos correspondentes.',
-        'A classificação normativa deve ser revisada pelo profissional responsável antes da utilização externa.'
-      ]
-    },
-    {
-      title: '12. CONCLUSÃO DE VALOR',
-      lines: r
-        ? [
-            `Com base no resultado registrado no snapshot, o valor unitário estimado é ${money(r.valorUnitario)} e o valor total estimado é ${money(r.valorTotal)}, considerando a área de referência de ${dec(r.areaReferencia)} m².`,
-            `Método: ${txt(r.metodo)}. Quantidade de amostras registrada no resultado: ${txt(r.numeroAmostras)}.`,
-            'A conclusão deve ser confirmada pelo profissional responsável antes do uso externo.'
-          ]
-        : [
-            'Não há resultado registrado no snapshot; não é possível apresentar conclusão de valor.'
-          ]
-    },
-    {
-      title: '13. QUALIFICAÇÃO E ASSINATURA DO RESPONSÁVEL TÉCNICO',
-      lines: [
-        `Responsável técnico: ${txt(d.responsavel)}`,
-        'Registro profissional (CREA/CRECI/CAU etc.): a ser informado pelo profissional habilitado.',
-        'A identificação final, a revisão, a assinatura e a responsabilidade técnica deste trabalho cabem exclusivamente ao profissional habilitado. Este documento é um artefato técnico de apoio gerado automaticamente e não constitui, por si só, assinatura ou anuência profissional.',
-        `Local e data: ${txt(d.municipio)} - ${txt(d.estado)}, ${dateBR(new Date())}`
-      ]
-    },
-    {
-      title: '14. RASTREABILIDADE, INTEGRIDADE E RESPONSABILIDADE',
-      lines: [
-        `ID da avaliação: ${txt(d.id)}`,
-        `Snapshot SHA-256: ${hash}`,
-        `Data de geração do arquivo: ${dateTimeBR(new Date())}`,
-        `Status no snapshot: ${txt(d.status)}`,
-        `Versão do motor: ${txt(d.versaoMotor)}`,
-        `Hash dos parâmetros: ${txt(d.parametrosHash)}`,
-        'Este documento foi estruturado para apoiar a apresentação de uma avaliação de imóvel urbano e referencia a ABNT NBR 14653-1:2019 e a ABNT NBR 14653-2:2011. A conformidade integral não é declarada automaticamente: depende do caso concreto, da documentação, da metodologia efetivamente aplicável, da especificação alcançada e da revisão e responsabilidade do profissional habilitado.'
-      ]
+    /* rodapé numerado nas páginas buffers */
+    const range = doc.bufferedPageRange();
+    for (let i = range.start; i < range.start + range.count; i++) {
+      doc.switchToPage(i);
+      // O pdfkit quebra de página quando o texto começa abaixo da margem inferior.
+      // Alargamos a margem só durante o desenho do rodapé para posicioná-lo na faixa
+      // reservada (o conteúdo flui até maxY antigo, acima do rodapé).
+      const pagina = doc.page as PDFKit.PDFDocument['page'] & { margins: { bottom: number } };
+      const margemOriginal = pagina.margins.bottom;
+      pagina.margins.bottom = 30;
+      doc.font('Helvetica').fontSize(7.5).fillColor('#666666');
+      doc.text(
+        `Laudo ${txt(d.numero)} · Snapshot SHA-256 ${hash.slice(0, 12)}… · Página ${i + 1 - range.start} de ${range.count}`,
+        PDF_X,
+        doc.page.height - 46,
+        { width: PDF_W, align: 'center', lineBreak: false }
+      );
+      pagina.margins.bottom = margemOriginal;
     }
-  ];
+    doc.fillColor('#111111');
+    doc.end();
+  });
+}
+
+/* ------------------------------------------------------------------ */
+/* Renderizador DOCX                                                   */
+/* ------------------------------------------------------------------ */
+
+const BORDAS = {
+  top: { style: BorderStyle.SINGLE, size: 1, color: '999999' },
+  bottom: { style: BorderStyle.SINGLE, size: 1, color: '999999' },
+  left: { style: BorderStyle.SINGLE, size: 1, color: '999999' },
+  right: { style: BorderStyle.SINGLE, size: 1, color: '999999' },
+  insideHorizontal: { style: BorderStyle.SINGLE, size: 1, color: 'CCCCCC' },
+  insideVertical: { style: BorderStyle.SINGLE, size: 1, color: 'CCCCCC' }
+} as const;
+
+function docxCell(text: string, bold: boolean, size = 16): TableCell {
+  return new TableCell({
+    children: String(text).split('\n').map(linha =>
+      new Paragraph({ spacing: { after: 0 }, children: [new TextRun({ text: linha, bold, size })] })
+    )
+  });
+}
+
+function docxKV(rows: Array<[string, string]>): Table {
+  return new Table({
+    width: { size: 100, type: WidthType.PERCENTAGE },
+    borders: BORDAS,
+    rows: rows.map(([c, v]) =>
+      new TableRow({ children: [docxCell(c, true, 18), docxCell(v, false, 18)] })
+    )
+  });
+}
+
+function docxGrid(cols: string[], rows: string[][]): Table {
+  return new Table({
+    width: { size: 100, type: WidthType.PERCENTAGE },
+    borders: BORDAS,
+    rows: [
+      new TableRow({ children: cols.map(c => docxCell(c, true)) }),
+      ...rows.map(r => new TableRow({ children: r.map(c => docxCell(c, false)) }))
+    ]
+  });
+}
+
+async function renderDOCX(d: Dados, hash: string): Promise<Buffer> {
+  const blocos = montarLaudo(d, hash);
+  const capa = capaBloco(d, hash);
+  const children: Array<Paragraph | Table> = [];
+
+  children.push(new Paragraph({ spacing: { before: 2400, after: 240 }, alignment: AlignmentType.CENTER, children: [new TextRun({ text: capa.titulo, bold: true, size: 40 })] }));
+  for (const linha of capa.linhas) {
+    children.push(new Paragraph({ alignment: AlignmentType.CENTER, spacing: { after: 80 }, children: [new TextRun({ text: linha, size: 22 })] }));
+  }
+  children.push(new Paragraph({ spacing: { before: 400 }, alignment: AlignmentType.CENTER, children: [new TextRun({ text: 'Relatório técnico gerado automaticamente a partir de snapshot congelado e íntegro. Sujeito a revisão e responsabilidade do profissional habilitado.', italics: true, size: 18 })] }));
+  children.push(new Paragraph({ pageBreakBefore: true, children: [new TextRun({ text: '' })] }));
+
+  for (const bl of blocos) {
+    if (bl.t === 'h1') {
+      children.push(new Paragraph({ heading: HeadingLevel.HEADING_1, spacing: { before: 280, after: 120 }, children: [new TextRun({ text: bl.x, bold: true })] }));
+    } else if (bl.t === 'h2') {
+      children.push(new Paragraph({ heading: HeadingLevel.HEADING_2, spacing: { before: 200, after: 100 }, children: [new TextRun({ text: bl.x, bold: true })] }));
+    } else if (bl.t === 'p') {
+      children.push(new Paragraph({ spacing: { after: 120 }, alignment: AlignmentType.JUSTIFIED, children: [new TextRun({ text: bl.x, size: 20 })] }));
+    } else if (bl.t === 'bullets') {
+      for (const item of bl.items) {
+        children.push(new Paragraph({ spacing: { after: 60 }, bullet: { level: 0 }, children: [new TextRun({ text: item, size: 20 })] }));
+      }
+    } else if (bl.t === 'kv') {
+      children.push(docxKV(bl.rows));
+      children.push(new Paragraph({ spacing: { after: 80 }, children: [new TextRun({ text: '' })] }));
+    } else if (bl.t === 'grid') {
+      children.push(docxGrid(bl.cols, bl.rows));
+      children.push(new Paragraph({ spacing: { after: 80 }, children: [new TextRun({ text: '' })] }));
+    }
+  }
+
+  const doc = new Document({
+    creator: txt(d.responsavel),
+    title: `Laudo de avaliação ${txt(d.numero)}`,
+    description: `Snapshot SHA-256 ${hash}`,
+    sections: [{
+      properties: { page: { margin: { top: 1000, right: 1000, bottom: 1100, left: 1200 } } },
+      footers: {
+        default: new Footer({
+          children: [new Paragraph({
+            alignment: AlignmentType.CENTER,
+            children: [
+              new TextRun({ text: `Laudo ${txt(d.numero)} · Snapshot SHA-256 ${hash.slice(0, 12)}… · Página `, size: 14, color: '666666' }),
+              new TextRun({ children: [PageNumber.CURRENT], size: 14, color: '666666' }),
+              new TextRun({ text: ' de ', size: 14, color: '666666' }),
+              new TextRun({ children: [PageNumber.TOTAL_PAGES], size: 14, color: '666666' })
+            ]
+          })]
+        })
+      },
+      children
+    }]
+  });
+
+  return Packer.toBuffer(doc);
+}
+
+/* ------------------------------------------------------------------ */
+/* Renderizador XLSX                                                   */
+/* ------------------------------------------------------------------ */
+
+function xlsxStyleWorkbook(wb: XLSX.WorkBook) {
+  for (const name of wb.SheetNames) {
+    const ws = wb.Sheets[name];
+    if (!ws['!ref']) continue;
+    const range = XLSX.utils.decode_range(ws['!ref']);
+    for (let c = range.s.c; c <= range.e.c; c++) {
+      const address = XLSX.utils.encode_cell({ r: range.s.r, c });
+      if (ws[address]) {
+        ws[address].s = { font: { bold: true }, alignment: { vertical: 'center' } };
+      }
+    }
+    ws['!freeze'] = { xSplit: 0, ySplit: 1 };
+  }
 }
 
 export function tableColumns(rows: Dados[]): string[] {
   const cols: string[] = [];
-
   for (const row of rows) {
     for (const k of Object.keys(row)) {
       if (!cols.includes(k)) cols.push(k);
     }
   }
-
   return cols;
 }
 
-function isKeyValueRows(cols: string[]): boolean {
-  return (
-    cols.length === 2 &&
-    cols[0] === 'Campo' &&
-    cols[1] === 'Valor'
-  );
-}
-
-function pdfTable(
-  doc: PDFKit.PDFDocument,
-  rows: Dados[]
-) {
-  if (!rows.length) return;
-
-  const x = 55;
-  const width = 485;
-
-  const cols = tableColumns(rows);
-
-  if (!isKeyValueRows(cols)) {
-    const cellPad = 3;
-    const colWidths = cols.map(() => width / cols.length);
-
-    const drawRow = (cells: string[], bold: boolean) => {
-      doc
-        .font(bold ? 'Helvetica-Bold' : 'Helvetica')
-        .fontSize(8);
-
-      const heights = cells.map((c, i) =>
-        doc.heightOfString(c, {
-          width: colWidths[i] - cellPad * 2
-        })
-      );
-
-      const rowHeight =
-        Math.max(doc.currentLineHeight(), ...heights) + cellPad * 2;
-
-      const pageBottom = doc.page.height - doc.page.margins.bottom;
-
-      if (doc.y + rowHeight > pageBottom) {
-        doc.addPage();
-      }
-
-      const startY = doc.y;
-
-      cells.forEach((c, i) => {
-        const cellX =
-          x + colWidths.slice(0, i).reduce((a, b) => a + b, 0);
-
-        doc.text(c, cellX + cellPad, startY + cellPad, {
-          width: colWidths[i] - cellPad * 2,
-          lineBreak: true
-        });
-      });
-
-      for (let i = 0; i <= cols.length; i++) {
-        const bx =
-          x + colWidths.slice(0, i).reduce((a, b) => a + b, 0);
-
-        doc
-          .moveTo(bx, startY)
-          .lineTo(bx, startY + rowHeight)
-          .stroke();
-      }
-
-      doc
-        .moveTo(x, startY + rowHeight)
-        .lineTo(x + width, startY + rowHeight)
-        .stroke();
-
-      doc.y = startY + rowHeight;
-    };
-
-    drawRow(cols, true);
-
-    for (const row of rows) {
-      drawRow(
-        cols.map(c => txt(row[c])),
-        false
-      );
+function laudoSheetAOA(d: Dados, hash: string): (string | number)[][] {
+  const aoa: (string | number)[][] = [];
+  const capa = capaBloco(d, hash);
+  aoa.push([capa.titulo]);
+  for (const l of capa.linhas) aoa.push([l]);
+  aoa.push([]);
+  for (const bl of montarLaudo(d, hash)) {
+    if (bl.t === 'h1' || bl.t === 'h2') aoa.push([bl.x]);
+    else if (bl.t === 'p') aoa.push([bl.x]);
+    else if (bl.t === 'bullets') bl.items.forEach(i => aoa.push(['• ' + i]));
+    else if (bl.t === 'kv') bl.rows.forEach(([c, v]) => aoa.push([c, v]));
+    else if (bl.t === 'grid') {
+      aoa.push(bl.cols);
+      bl.rows.forEach(r => aoa.push(r));
     }
-
-    doc.moveDown(0.15);
-    return;
+    aoa.push([]);
   }
-
-  const col1 = 190;
-  const col2 = width - col1;
-
-  for (const row of rows) {
-    const campo = txt(row.Campo);
-    const valor = txt(row.Valor);
-
-    const startY = doc.y;
-
-    doc
-      .font('Helvetica-Bold')
-      .fontSize(8)
-      .text(campo, x, startY, {
-        width: col1,
-        continued: false
-      });
-
-    const afterCampo = doc.y;
-
-    doc
-      .font('Helvetica')
-      .fontSize(8)
-      .text(valor, x + col1, startY, {
-        width: col2,
-        continued: false
-      });
-
-    const afterValor = doc.y;
-
-    doc.y = Math.max(afterCampo, afterValor) + 3;
-
-    doc
-      .moveTo(x, doc.y)
-      .lineTo(x + width, doc.y)
-      .stroke();
-
-    doc.moveDown(0.15);
-  }
+  return aoa;
 }
 
-function docxTable(rows: Dados[]): Table | null {
-  if (!rows.length) return null;
+function renderXLSX(d: Dados, hash: string, dadosJson: string): Buffer {
+  const wb = XLSX.utils.book_new();
+  const p: Dados = d.imovelAvaliando ?? {};
 
-  const cols = tableColumns(rows);
-  const keyValue = isKeyValueRows(cols);
+  const laudo = XLSX.utils.aoa_to_sheet(laudoSheetAOA(d, hash));
+  laudo['!cols'] = [{ wch: 42 }, { wch: 60 }, { wch: 30 }, { wch: 30 }, { wch: 30 }, { wch: 30 }, { wch: 20 }, { wch: 20 }, { wch: 20 }, { wch: 20 }];
+  XLSX.utils.book_append_sheet(wb, laudo, 'Laudo');
 
-  const makeCell = (text: string, bold: boolean) =>
-    new TableCell({
-      children: [
-        new Paragraph({
-          children: [
-            new TextRun({
-              text,
-              bold
-            })
-          ]
-        })
-      ]
-    });
+  const add = (name: string, rows: Dados[]) => {
+    const dataRows = rows.length ? rows : [{ Informação: 'Sem registros no snapshot' }];
+    const ws = XLSX.utils.json_to_sheet(dataRows);
+    const firstRow = dataRows[0] ?? {};
+    ws['!cols'] = Object.keys(firstRow).map(key => ({ wch: Math.min(55, Math.max(14, key.length + 4)) }));
+    XLSX.utils.book_append_sheet(wb, ws, name.slice(0, 31));
+  };
 
-  const tableRows: TableRow[] = [];
+  const homs = arr(d.homogeneizacoes);
 
-  if (!keyValue) {
-    tableRows.push(
-      new TableRow({
-        children: cols.map(c => makeCell(c, true))
-      })
-    );
-  }
+  add('Imóvel', Object.entries({
+    Tipo: txt(d.tipoImovel), Logradouro: txt(p.logradouro), Numero: txt(p.numero), Bairro: txt(p.bairro),
+    Municipio: txt(d.municipio), UF: txt(d.estado), CEP: txt(p.cep), Matricula: txt(p.matricula),
+    Cadastro: txt(p.cadastroImobiliario), SituacaoQuadra: lab(L_QUADRA, p.situacaoQuadra),
+    AreaTerreno_m2: p.areaTerreno ?? null, Testada_m: p.testadaPrincipal ?? null,
+    ProfundidadeUtilizada_m: p.profundidadeUtilizada ?? null, Padrao: lab(L_PADRAO, p.padrao),
+    Conservacao: lab(L_CONS, p.conservacao), Idade_anos: p.idade ?? null, VidaUtil_anos: p.vidaUtil ?? null,
+    Elevador: txt(p.elevador), Vagas: p.numeroVagas ?? null, Observacoes: txt(p.observacoes)
+  }).map(([Campo, Valor]) => ({ Campo, Valor: txt(Valor) })));
 
-  for (const row of rows) {
-    tableRows.push(
-      new TableRow({
-        children: keyValue
-          ? [
-              makeCell(txt(row.Campo), true),
-              makeCell(txt(row.Valor), false)
-            ]
-          : cols.map(c => makeCell(txt(row[c]), false))
-      })
-    );
-  }
-
-  return new Table({
-    width: {
-      size: 100,
-      type: WidthType.PERCENTAGE
-    },
-    borders: {
-      top: {
-        style: BorderStyle.SINGLE,
-        size: 1,
-        color: '999999'
-      },
-      bottom: {
-        style: BorderStyle.SINGLE,
-        size: 1,
-        color: '999999'
-      },
-      left: {
-        style: BorderStyle.SINGLE,
-        size: 1,
-        color: '999999'
-      },
-      right: {
-        style: BorderStyle.SINGLE,
-        size: 1,
-        color: '999999'
-      },
-      insideHorizontal: {
-        style: BorderStyle.SINGLE,
-        size: 1,
-        color: 'CCCCCC'
-      },
-      insideVertical: {
-        style: BorderStyle.SINGLE,
-        size: 1,
-        color: 'CCCCCC'
-      }
-    },
-    rows: tableRows
-  });
-}
-
-function xlsxStyleWorkbook(wb: XLSX.WorkBook) {
-  for (const name of wb.SheetNames) {
-    const ws = wb.Sheets[name];
-
-    if (!ws['!ref']) continue;
-
-    const range = XLSX.utils.decode_range(ws['!ref']);
-
-    for (let c = range.s.c; c <= range.e.c; c++) {
-      const address = XLSX.utils.encode_cell({
-        r: range.s.r,
-        c
-      });
-
-      if (ws[address]) {
-        ws[address].s = {
-          font: {
-            bold: true
-          },
-          alignment: {
-            vertical: 'center'
-          }
-        };
-      }
-    }
-
-    ws['!freeze'] = {
-      xSplit: 0,
-      ySplit: 1
+  add('Amostras', arr(d.amostras).map((a, i) => {
+    const h = homs.find(x => x.amostraId === a.id);
+    return {
+      N: i + 1,
+      Identificador: txt(a.identificador),
+      Fonte: txt(a.fonte),
+      TipoFonte: lab(L_TFONTE, a.tipoFonte),
+      URL: txt(a.url),
+      Coleta: dateBR(a.dataColeta),
+      Bairro: txt(a.bairro),
+      SituacaoQuadra: lab(L_QUADRA, a.situacaoQuadra),
+      Area_m2: a.areaTerreno ?? null,
+      Testada_m: a.testada ?? null,
+      Profundidade_m: a.profundidade ?? null,
+      Padrao: lab(L_PADRAO, a.padrao),
+      Conservacao: lab(L_CONS, a.conservacao),
+      TipoValor: lab(L_TVAL, a.tipoValor),
+      Valor: a.tipoValor === 'OFERTA' ? a.valorOferta ?? null : a.valorTransacao ?? null,
+      VU_Original: h?.valorUnitarioOriginal ?? null,
+      VU_Homogeneizado: h?.valorUnitarioHomogeneizado ?? null,
+      Situacao: a.status === 'ATIVA' ? 'Ativa' : 'Excluída',
+      Observacoes: txt(a.observacoes)
     };
+  }));
 
-    ws['!autofilter'] = {
-      ref: ws['!ref']
+  add('Homogeneização', homs.map((h, i) => {
+    const a = arr(d.amostras).find(x => x.id === h.amostraId);
+    return {
+      N: i + 1,
+      Amostra: txt(a?.identificador ?? h.amostraId),
+      VU_Original: h.valorUnitarioOriginal,
+      FA: h.fa, FT: h.ft, FP: h.fp, FO: h.fo, FE: h.fe, FPC: h.fpc, FC: h.fc,
+      FELEV: h.felev, FG: h.fg, FI: h.fi,
+      Produto: h.produtoFatores,
+      VU_Homogeneizado: h.valorUnitarioHomogeneizado
     };
+  }));
+
+  const r = latestResult(d);
+  add('Resultado', r ? [{
+    Campo: 'Método', Valor: 'Média aritmética após saneamento'
+  }, {
+    Campo: 'Amostras aprovadas', Valor: txt(r.numeroAmostras)
+  }, {
+    Campo: 'Valor unitário (R$/m²)', Valor: txt(r.valorUnitario)
+  }, {
+    Campo: 'Área de referência (m²)', Valor: txt(r.areaReferencia)
+  }, {
+    Campo: 'VALOR TOTAL (R$)', Valor: txt(r.valorTotal)
+  }, {
+    Campo: 'Valor por extenso', Valor: valorPorExtenso(r.valorTotal)
+  }, {
+    Campo: 'Coeficiente de variação', Valor: txt(r.coeficienteVariacao)
+  }, {
+    Campo: 'Erro padrão', Valor: txt(r.erroPadrao)
+  }, {
+    Campo: 'Intervalo de confiança 80%', Valor: intervaloConfianca80(r)
+  }] : [{ Campo: 'Resultado', Valor: 'Não registrado no snapshot' }]);
+
+  add('Saneamento', d.saneamento ? [{
+    Campo: 'Método', Valor: txt(d.saneamento.metodo)
+  }, {
+    Campo: 'Média', Valor: txt(d.saneamento.media)
+  }, {
+    Campo: 'Mediana', Valor: txt(d.saneamento.mediana)
+  }, {
+    Campo: 'Desvio padrão', Valor: txt(d.saneamento.desvioPadrao)
+  }, {
+    Campo: 'Limite inferior', Valor: txt(d.saneamento.limiteInferior)
+  }, {
+    Campo: 'Limite superior', Valor: txt(d.saneamento.limiteSuperior)
+  }, {
+    Campo: 'Chauvenet sinalizado', Valor: d.saneamento.criterioChauvenet ? 'Sim' : 'Não'
+  }, {
+    Campo: 'Decisão técnica', Valor: txt(d.saneamento.decisaoChauvenet ?? 'PENDENTE')
+  }, {
+    Campo: 'Justificativa', Valor: txt(d.saneamento.justificativaChauvenet)
+  }, {
+    Campo: 'Responsável pela decisão', Valor: txt(d.saneamento.decisaoChauvenetPor)
+  }, {
+    Campo: 'Data da decisão', Valor: dateTimeBR(d.saneamento.decisaoChauvenetEm)
+  }] : [{ Campo: 'Saneamento', Valor: 'Não registrado no snapshot' }]);
+
+  add('Exclusões', arr(d.exclusoes).map((e, i) => ({
+    N: i + 1,
+    Amostra: txt(e.amostra?.identificador ?? e.amostraId),
+    Criterio: txt(e.criterio),
+    Motivo: txt(e.motivo),
+    Valor: e.valor ?? null,
+    Usuario: txt(e.usuario),
+    Data: dateTimeBR(e.dataExclusao)
+  })));
+
+  add('Fatores', arr(d.fatores).flatMap(f =>
+    arr(f.parametros).length
+      ? arr(f.parametros).map(pp => ({ Fator: txt(f.codigo), Nome: txt(f.nome), Formula: txt(f.formula), Chave: humanChave(f.codigo, pp.chave), Valor: pp.valor ?? null, Unidade: txt(pp.unidade), Justificativa: txt(pp.justificativa) }))
+      : [{ Fator: txt(f.codigo), Nome: txt(f.nome), Formula: txt(f.formula), Chave: '—', Valor: null, Unidade: '—', Justificativa: '—' }]
+  ));
+
+  add('Auditoria', arr(d.auditorias).map((a, i) => ({
+    N: i + 1,
+    DataHora: dateTimeBR(a.dataHora),
+    Acao: txt(a.acao),
+    Entidade: txt(a.entidade),
+    Usuario: txt(a.usuario),
+    Motivo: txt(a.motivo)
+  })));
+
+  add('Controle', [{
+    AvaliacaoId: txt(d.id),
+    Numero: txt(d.numero),
+    StatusSnapshot: lab(L_STATUS, d.status),
+    StatusAtual: 'Validado no momento da emissão',
+    SnapshotSHA256: hash,
+    ParametrosHash: txt(d.parametrosHash),
+    VersaoMotor: txt(d.versaoMotor),
+    Responsavel: txt(d.responsavel),
+    GeradoEm: new Date().toISOString(),
+    Aviso: 'Planilha derivada do snapshot congelado; não substitui revisão técnica.'
+  }]);
+
+  const chunkSize = 30000;
+  const snapRows: Dados[] = [];
+  for (let i = 0, parte = 1; i < dadosJson.length; i += chunkSize, parte++) {
+    snapRows.push({ Parte: parte, Inicio: i, Fim: Math.min(i + chunkSize, dadosJson.length), JSON: dadosJson.slice(i, i + chunkSize) });
   }
+  add('Snapshot_JSON', snapRows);
+
+  xlsxStyleWorkbook(wb);
+
+  return XLSX.write(wb, { type: 'buffer', bookType: 'xlsx', cellDates: true }) as Buffer;
 }
+
+/* ------------------------------------------------------------------ */
+/* API pública                                                         */
+/* ------------------------------------------------------------------ */
 
 export class ReportService {
-  static async pdf(
-    prisma: PrismaClient,
-    id: string
-  ) {
+  static async pdf(prisma: PrismaClient, id: string) {
     const { s, data } = await snap(prisma, id);
-
-    const sections = reportSections(
-      data,
-      s.hashSha256
-    );
-
-    return new Promise<string>((resolve, reject) => {
-      const chunks: Buffer[] = [];
-
-      const doc = new PDFDocument({
-        size: 'A4',
-        margins: {
-          top: 58,
-          bottom: 58,
-          left: 55,
-          right: 55
-        },
-        bufferPages: true,
-        info: {
-          Title: `Laudo de avaliação ${txt(data.numero)}`,
-          Author: txt(data.responsavel),
-          Subject: 'Relatório técnico de avaliação imobiliária',
-          Keywords: `RoboAvaliador, ${s.hashSha256}`
-        }
-      });
-
-      doc.on('data', (c: Buffer) => chunks.push(c));
-
-      doc.on('error', reject);
-
-      doc.on('end', async () => {
-        try {
-          const buffer = Buffer.concat(chunks);
-
-          const p = await saveDocument(
-            prisma,
-            id,
-            'PDF',
-            'LAUDO',
-            buffer,
-            s.hashSha256
-          );
-
-          resolve(p);
-        } catch (e) {
-          reject(e);
-        }
-      });
-
-      doc
-        .font('Helvetica-Bold')
-        .fontSize(19)
-        .text(
-          'LAUDO DE AVALIAÇÃO IMOBILIÁRIA',
-          {
-            align: 'center'
-          }
-        );
-
-      doc.moveDown(0.5);
-
-      doc
-        .font('Helvetica')
-        .fontSize(10)
-        .text(
-          `${txt(data.numero)} — ${txt(data.titulo)}`,
-          {
-            align: 'center'
-          }
-        );
-
-      doc.moveDown(0.4);
-
-      doc
-        .fontSize(8)
-        .text(
-          `Snapshot SHA-256: ${s.hashSha256}`,
-          {
-            align: 'center'
-          }
-        );
-
-      doc.moveDown(1);
-
-      for (const sec of sections) {
-        doc
-          .font('Helvetica-Bold')
-          .fontSize(12)
-          .text(sec.title);
-
-        doc.moveDown(0.25);
-
-        if (sec.rows) {
-          pdfTable(doc, sec.rows);
-        }
-
-        if (sec.lines) {
-          doc
-            .font('Helvetica')
-            .fontSize(9);
-
-          for (const line of sec.lines) {
-            doc.text(line, {
-              width: 485,
-              lineGap: 2
-            });
-
-            doc.moveDown(0.08);
-          }
-        }
-
-        doc.moveDown(0.65);
-      }
-
-      doc.addPage();
-      doc.font('Helvetica-Bold').fontSize(12).text('15. DADOS INTEGRAIS DO SNAPSHOT');
-      doc.moveDown(0.25);
-      doc.font('Helvetica').fontSize(7);
-      doc.text(`SHA-256: ${s.hashSha256}`);
-      doc.text('A seção abaixo reproduz integralmente o JSON congelado e validado pelo SHA-256.');
-      doc.moveDown(0.3);
-      doc.fontSize(6.5);
-      const jsonPretty = JSON.stringify(JSON.parse(s.dadosJson), null, 2);
-      doc.text(jsonPretty, { width: 485, lineGap: 0.5 });
-
-      const range = doc.bufferedPageRange();
-
-      for (
-        let i = range.start;
-        i < range.start + range.count;
-        i++
-      ) {
-        doc.switchToPage(i);
-
-        doc
-          .font('Helvetica')
-          .fontSize(7.5)
-          .text(
-            `Avaliação ${txt(data.numero)} | Snapshot SHA-256: ${s.hashSha256} | Página ${i + 1 - range.start} de ${range.count}`,
-            55,
-            doc.page.height - 36,
-            {
-              width: 485,
-              align: 'center'
-            }
-          );
-      }
-
-      doc.end();
-    });
+    const buffer = await renderPDF(data, s.hashSha256);
+    return saveDocument(prisma, id, 'PDF', 'LAUDO', buffer, s.hashSha256);
   }
 
-  static async docx(
-    prisma: PrismaClient,
-    id: string
-  ) {
+  static async docx(prisma: PrismaClient, id: string) {
     const { s, data } = await snap(prisma, id);
-
-    const sections = reportSections(
-      data,
-      s.hashSha256
-    );
-
-    const children: Array<Paragraph | Table> = [];
-
-    children.push(
-      new Paragraph({
-        alignment: AlignmentType.CENTER,
-        spacing: {
-          after: 240
-        },
-        children: [
-          new TextRun({
-            text: 'LAUDO DE AVALIAÇÃO IMOBILIÁRIA',
-            bold: true,
-            size: 32
-          })
-        ]
-      })
-    );
-
-    children.push(
-      new Paragraph({
-        alignment: AlignmentType.CENTER,
-        spacing: {
-          after: 180
-        },
-        children: [
-          new TextRun({
-            text: `${txt(data.numero)} — ${txt(data.titulo)}`,
-            bold: true,
-            size: 24
-          })
-        ]
-      })
-    );
-
-    children.push(
-      new Paragraph({
-        alignment: AlignmentType.CENTER,
-        spacing: {
-          after: 300
-        },
-        children: [
-          new TextRun({
-            text: `Snapshot SHA-256: ${s.hashSha256}`,
-            size: 16
-          })
-        ]
-      })
-    );
-
-    for (const sec of sections) {
-      children.push(
-        new Paragraph({
-          heading: HeadingLevel.HEADING_1,
-          spacing: {
-            before: 280,
-            after: 120
-          },
-          children: [
-            new TextRun({
-              text: sec.title,
-              bold: true
-            })
-          ]
-        })
-      );
-
-      if (sec.rows) {
-        const table = docxTable(sec.rows);
-
-        if (table) {
-          children.push(table);
-        }
-      }
-
-      if (sec.lines) {
-        for (const line of sec.lines) {
-          children.push(
-            new Paragraph({
-              spacing: {
-                after: 100
-              },
-              children: [
-                new TextRun({
-                  text: line,
-                  size: 20
-                })
-              ]
-            })
-          );
-        }
-      }
-    }
-
-    children.push(
-      new Paragraph({
-        heading: HeadingLevel.HEADING_1,
-        children: [new TextRun({ text: '15. DADOS INTEGRAIS DO SNAPSHOT', bold: true })]
-      })
-    );
-    children.push(
-      new Paragraph({
-        children: [new TextRun({ text: `SHA-256: ${s.hashSha256}`, bold: true })]
-      })
-    );
-    const jsonPretty = JSON.stringify(JSON.parse(s.dadosJson), null, 2);
-    for (const line of jsonPretty.split('\n')) {
-      children.push(new Paragraph({ spacing: { after: 0 }, children: [new TextRun({ text: line, size: 12, font: 'Courier New' })] }));
-    }
-
-    const doc = new Document({
-      creator: txt(data.responsavel),
-      title: `Laudo de avaliação ${txt(data.numero)}`,
-      description: `Snapshot SHA-256 ${s.hashSha256}`,
-      sections: [
-        {
-          properties: {
-            page: {
-              margin: {
-                top: 1000,
-                right: 1000,
-                bottom: 1000,
-                left: 1200
-              }
-            }
-          },
-          children
-        }
-      ]
-    });
-
-    const buffer = await Packer.toBuffer(doc);
-
-    return saveDocument(
-      prisma,
-      id,
-      'DOCX',
-      'LAUDO',
-      buffer,
-      s.hashSha256
-    );
+    const buffer = await renderDOCX(data, s.hashSha256);
+    return saveDocument(prisma, id, 'DOCX', 'LAUDO', buffer, s.hashSha256);
   }
 
-  static async xlsx(
-    prisma: PrismaClient,
-    id: string
-  ) {
+  static async xlsx(prisma: PrismaClient, id: string) {
     const { s, data } = await snap(prisma, id);
-
-    const wb = XLSX.utils.book_new();
-
-    const p = data.imovelAvaliando ?? {};
-
-    const add = (
-      name: string,
-      rows: Dados[]
-    ) => {
-      const dataRows = rows.length
-        ? rows
-        : [{ Informação: 'Sem registros no snapshot' }];
-
-      const ws = XLSX.utils.json_to_sheet(dataRows);
-
-      const firstRow = dataRows[0] ?? {};
-
-      ws['!cols'] = Object.keys(firstRow).map(
-        key => ({
-          wch: Math.min(
-            55,
-            Math.max(14, key.length + 4)
-          )
-        })
-      );
-
-      XLSX.utils.book_append_sheet(
-        wb,
-        ws,
-        name.slice(0, 31)
-      );
-    };
-
-    add(
-      'Identificação',
-      generalRows(data)
-    );
-
-    add(
-      'Imóvel',
-      propertyRows(p)
-    );
-
-    add(
-      'Amostras',
-      sampleRows(data)
-    );
-
-    add(
-      'Homogeneização',
-      homRows(data)
-    );
-
-    add(
-      'Saneamento',
-      sanitationRows(data)
-    );
-
-    add(
-      'Resultado',
-      resultRows(data)
-    );
-
-    add(
-      'Exclusões',
-      exclusionRows(data)
-    );
-
-    add(
-      'Fatores',
-      factorRows(data)
-    );
-
-    add('Resultados', allResultRows(data));
-    add('Histórico', historyRows(data));
-    add('Auditorias', auditRows(data));
-    add('Fotografias', photoRows(data));
-    add('Snapshot_JSON', snapshotJsonRows(s.dadosJson));
-
-    add(
-      'Especificação',
-      [
-        { Item: 'Referência estrutural', Valor: 'ABNT NBR 14653-1:2019 / ABNT NBR 14653-2:2011' },
-        { Item: 'Grau de fundamentação', Valor: 'Não determinado automaticamente' },
-        { Item: 'Grau de precisão', Valor: 'Não determinado automaticamente' },
-        { Item: 'Observação', Valor: 'Revisão do profissional responsável necessária antes da emissão externa.' }
-      ]
-    );
-
-    add(
-      'Controle',
-      [
-        {
-          AvaliacaoId: txt(data.id),
-          Numero: txt(data.numero),
-          StatusSnapshot: txt(data.status),
-          StatusAtual: 'Validado no momento da emissão',
-          SnapshotSHA256: s.hashSha256,
-          ParametrosHash: txt(data.parametrosHash),
-          VersaoMotor: txt(data.versaoMotor),
-          Responsavel: txt(data.responsavel),
-          GeradoEm: new Date().toISOString(),
-          Aviso:
-            'Planilha derivada do snapshot congelado; não substitui revisão técnica.'
-        }
-      ]
-    );
-
-    xlsxStyleWorkbook(wb);
-
-    const buffer = XLSX.write(
-      wb,
-      {
-        type: 'buffer',
-        bookType: 'xlsx',
-        cellDates: true
-      }
-    ) as Buffer;
-
-    return saveDocument(
-      prisma,
-      id,
-      'XLSX',
-      'PLANILHA',
-      buffer,
-      s.hashSha256
-    );
+    const buffer = renderXLSX(data, s.hashSha256, s.dadosJson);
+    return saveDocument(prisma, id, 'XLSX', 'PLANILHA', buffer, s.hashSha256);
   }
 
-  static async generateAll(
-    prisma: PrismaClient,
-    id: string
-  ) {
+  static async generateAll(prisma: PrismaClient, id: string) {
     /*
      * Cada formato executa novamente a validação do snapshot.
      * Isso mantém a proteção mesmo quando PDF, DOCX ou XLSX
      * são solicitados individualmente.
      */
-
-    const pdf = await ReportService.pdf(
-      prisma,
-      id
-    );
-
-    const docx = await ReportService.docx(
-      prisma,
-      id
-    );
-
-    const xlsx = await ReportService.xlsx(
-      prisma,
-      id
-    );
-
-    return {
-      pdf,
-      docx,
-      xlsx
-    };
+    const pdf = await ReportService.pdf(prisma, id);
+    const docx = await ReportService.docx(prisma, id);
+    const xlsx = await ReportService.xlsx(prisma, id);
+    return { pdf, docx, xlsx };
   }
 }

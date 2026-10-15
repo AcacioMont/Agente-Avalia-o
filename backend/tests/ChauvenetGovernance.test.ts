@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { evaluateChauvenetEmissionGate } from '../src/engines/safety-primitives.js';
+import { evaluateChauvenetEmissionGate } from '../src/core/safety-primitives.js';
 
 describe('Governança de Chauvenet', () => {
   it('bloqueia sinal sem decisão técnica', () => {

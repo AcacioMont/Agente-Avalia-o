@@ -1,5 +1,5 @@
 import { PrismaClient } from '@prisma/client';
-import { calcularHashSnapshot, evaluateChauvenetEmissionGate } from './safety-primitives.js';
+import { calcularHashSnapshot, evaluateChauvenetEmissionGate } from '../core/safety-primitives.js';
 import { loadSystemParameters } from '../services/ParameterService.js';
 
 export type Severidade = 'CRITICO' | 'ALERTA' | 'INFO';

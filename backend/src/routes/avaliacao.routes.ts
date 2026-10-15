@@ -710,7 +710,7 @@ r.post('/:id/emitir', async (req, res) => {
         arquivos
       },
       usuario: 'sistema',
-      motivo: 'Emissão de PDF, DOCX e XLSX após validaçãoo de prontidão'
+      motivo: 'Emissão de PDF, DOCX e XLSX após validação de prontidão'
     });
 
     res.json({

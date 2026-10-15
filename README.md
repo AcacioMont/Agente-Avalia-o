@@ -1,67 +1,102 @@
-# RoboAvaliador — pacote executável local
+# RoboAvaliador
 
-Este pacote foi montado a partir do `RoboAvaliador_MASTER_CORRIGIDO.md` e segue a ordem solicitada:
+Sistema de avaliação imobiliária com cálculo comparativo, saneamento estatístico,
+governança por snapshot e emissão de laudos nos moldes da série **ABNT NBR 14653**
+(14653-1:2019 e 14653-2:2011, conforme aplicabilidade).
 
-1. Banco: SQLite, schema Prisma, limpeza, generate, db push, seed idempotente.
-2. Core: CalculationEngine + SaneamentoEngine + testes Vitest.
-3. API: rotas, parâmetros carregados do banco, auditoria e snapshot SHA-256.
-4. Relatórios: um único ReportService para PDF, DOCX e XLSX; hash dos arquivos.
-5. Interface: dashboard, cálculo, saneamento, snapshot, emissão.
-6. Portabilidade: scripts BAT, SQLite, backup/restauração e Node.js portátil.
+> ⚠️ O laudo gerado é um artefato técnico de apoio. A revisão, a assinatura e a
+> responsabilidade pelo trabalho cabem ao profissional habilitado.
 
-## Primeira execução
+## Stack
 
-### Opção A — computador com Node instalado
-
-PowerShell:
-
-```powershell
-npm install
-npm run install:all
-npm run db:init
-npm run build
-npm run start
-```
-
-Abra `http://localhost:3000`.
-
-### Opção B — computador sem Node instalado
-
-Execute `INICIAR_ROBO_AVALIADOR.bat`.
-
-O script prepara um Node.js portátil em `runtime\node`, instala as dependências, cria o SQLite, executa o seed, compila o frontend e inicia a API.
-
-A primeira execução precisa de internet para baixar o runtime Node.js e os pacotes npm. Depois disso, o diretório pode ser copiado para outro PC Windows com a mesma arquitetura.
-
-## Fluxo de uso
-
-1. Criar uma avaliação pela interface.
-2. Cadastrar pelo menos o número mínimo de amostras configurado.
-3. Calcular.
-4. Revisar matriz, saneamento e alertas.
-5. Resolver tecnicamente eventuais outliers.
-6. Congelar snapshot.
-7. Auditar e emitir o laudo formal.
-8. Baixar PDF/DOCX/XLSX.
-9. Fazer backup.
-
-## Regra de emissão
-
-A emissão formal é bloqueada quando a auditoria encontra alerta crítico, amostra ativa sem homogeneização, outlier pendente, resultado inválido/inexistente, snapshot ausente ou hash inconsistente. O mínimo de amostras é parametrizado no banco pelo fator `REGRAS.MIN_AMOSTRAS`.
-
-## Regra de segurança técnica
-
-Outlier não deve ser apagado automaticamente. O sistema apenas sinaliza. A exclusão técnica precisa ser registrada e auditável antes de um novo cálculo.
-
-Parâmetros jurídicos, tributários e normativos não são hard-coded como verdade universal. Devem ser cadastrados e versionados conforme o município, finalidade e referência técnica aplicável.
+| Camada | Tecnologia |
+|---|---|
+| Backend | Node.js + TypeScript + Express 5 + Prisma 6 + SQLite |
+| Frontend | Vite + React 19 + TypeScript |
+| Testes | Vitest (backend) |
+| Relatórios | PDF (pdfkit), DOCX (docx), XLSX (xlsx) |
 
 ## Estrutura
 
-- `backend/prisma/schema.prisma`: banco.
-- `backend/src/engines`: cálculo e saneamento.
-- `backend/src/services`: parâmetros, auditoria, snapshot e relatórios.
-- `backend/src/routes`: API.
-- `frontend/src`: dashboard.
-- `data`: SQLite.
-- `reports`: documentos emitidos.
-- `backups`: cópias do banco e relatórios.
+```
+backend/
+  src/
+    core/          primitivas de segurança (hash de snapshot, gate de Chauvenet,
+                   persistência com compensação) — fonte única
+    engines/       CalculationEngine, RuleEngine (auditoria), SaneamentoEngine
+    services/      ReportService (laudos NBR 14653), SnapshotService,
+                   GovernanceService, ParameterService, AuditService
+    routes/        /api/v1/avaliacoes, /api/v1/export, /api/v1/sistema
+  prisma/          schema SQLite, seed de fatores e parâmetros
+  tests/           testes de contrato e robustez
+frontend/src/      interface (App + componentes + modais)
+docs/              documentação técnica e normativa
+_historico/        scripts e registros de correções antigas (não fazem parte do build)
+reports/           laudos gerados (ignorado pelo git)
+data/              banco SQLite (ignorado pelo git)
+```
+
+## Como rodar
+
+Pré-requisito: Node.js 20+ (os `.bat` da raiz usam o Node portátil de `runtime/`
+quando executados no Windows).
+
+```powershell
+npm install
+npm run install:all          # instala backend e frontend
+
+Copy-Item .env.example backend\.env   # na primeira execução (ou use backend/.env.example)
+# edite backend/.env se precisar mudar porta ou caminho do banco
+
+npm run db:init              # gera o client Prisma, cria o banco e semeia fatores/parâmetros
+npm run dev                  # backend :3000 + frontend :5173
+```
+
+Abra **http://localhost:5173**.
+
+> O arquivo `.env` é lido a partir da pasta `backend/` (cwd do servidor e do Prisma).
+> Um `.env` somente na raiz **não** é lido.
+
+### Scripts úteis
+
+| Comando | Efeito |
+|---|---|
+| `npm run dev` | sobe backend e frontend juntos |
+| `npm test` | testes do backend (Vitest) |
+| `npm run build` | compila backend (tsc) e frontend (vite) |
+| `npm run db:reset` | limpa, recria e semeia o banco |
+| `npm run qa` | build + testes |
+
+No Windows, os atalhos operacionais continuam na raiz:
+`INICIAR_ROBO_AVALIADOR.bat`, `TESTAR_ROBO.bat`, `FAZER_BACKUP.bat`, `RESTAURAR_BACKUP.bat`.
+
+## Fluxo de trabalho (governança)
+
+1. **Criar avaliação** e cadastrando o imóvel avaliando;
+2. **Pesquisar/cadastrar amostras** de mercado (mínimo configurado em `REGRAS.MIN_AMOSTRAS`);
+3. **Calcular** — homogeneização por fatores, saneamento (limites + Chauvenet) e resultado;
+4. Se Chauvenet sinalizar valores, **registrar decisão técnica** (manter com justificativa ou excluir e recalcular);
+5. **Congelar snapshot** — estado técnico vira imutável, com hash SHA-256 (`PRONTA_PARA_EMISSAO`);
+6. **Emitir laudo** — o botão habilita automaticamente quando a auditoria de prontidão está APTA;
+   gera PDF, DOCX e XLSX a partir **somente** do snapshot congelado.
+
+Qualquer alteração de dados depois do congelamento invalida o snapshot (é preciso recalcular e congelar de novo).
+
+## Laudos (NBR 14653)
+
+O relatório segue o arranjo: capa, resumo executivo (com valor por extenso e intervalo
+de confiança), objetivo, identificação, pressupostos e limitações, caracterização do
+imóvel, pesquisa de mercado, metodologia, homogeneização, saneamento, cálculo e
+resultado, especificação (graus), conclusão, assinatura, anexos (amostras, parâmetros,
+trilha de auditoria) e rastreabilidade com SHA-256 do snapshot.
+
+Os **graus de fundamentação e de precisão não são declarados automaticamente**: o motor
+explicita que não os determinou, e a classificação normativa é do profissional responsável.
+Detalhes em `docs/ABNT_ESTRUTURA_LAUDO.md`.
+
+## Segurança e dados
+
+- `data/` (banco com dados reais), `runtime/` (Node portátil), `reports/` e `node_modules/`
+  são ignorados pelo git — nunca os commite;
+- segredos ficam apenas em `backend/.env` (ignorado); existe `backend/.env.example` como modelo;
+- todo documento gerado registra hash SHA-256 próprio e do snapshot que o originou.
