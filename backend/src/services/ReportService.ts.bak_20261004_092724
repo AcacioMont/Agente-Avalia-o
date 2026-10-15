@@ -1,0 +1,635 @@
+
+import fs from 'node:fs';
+import path from 'node:path';
+import crypto from 'node:crypto';
+import PDFDocument from 'pdfkit';
+import { Document, Packer, Paragraph, TextRun } from 'docx';
+import * as XLSX from 'xlsx';
+import { PrismaClient } from '@prisma/client';
+import { getLatestSnapshot } from './SnapshotService.js';
+import { RuleEngine } from '../engines/RuleEngine.js';
+import { persistArtifactWithCompensation } from './safety-primitives.js';
+
+const root = path.resolve(process.cwd(), '../../reports');
+fs.mkdirSync(root, { recursive: true });
+
+type Dados = Record<string, any>;
+
+function texto(v: unknown): string {
+  if (v === null || v === undefined || v === '') return 'Não informado';
+  if (typeof v === 'boolean') return v ? 'Sim' : 'Não';
+  return String(v);
+}
+
+function numero(v: unknown): number | null {
+  if (v === null || v === undefined || v === '') return null;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+}
+
+function decimal(v: unknown, casas = 2): string {
+  const n = numero(v);
+  return n === null
+    ? 'Não informado'
+    : n.toLocaleString('pt-BR', {
+        minimumFractionDigits: casas,
+        maximumFractionDigits: casas
+      });
+}
+
+function moeda(v: unknown): string {
+  const n = numero(v);
+  return n === null
+    ? 'Não informado'
+    : n.toLocaleString('pt-BR', {
+        style: 'currency',
+        currency: 'BRL'
+      });
+}
+
+function dataBR(v: unknown): string {
+  if (!v) return 'Não informado';
+  const d = new Date(String(v));
+  return Number.isNaN(d.getTime())
+    ? texto(v)
+    : d.toLocaleDateString('pt-BR');
+}
+
+function lista(v: unknown): Dados[] {
+  return Array.isArray(v) ? v : [];
+}
+
+function resultadoAtual(data: Dados): Dados | undefined {
+  const resultados = lista(data.resultados);
+  return resultados.length ? resultados[resultados.length - 1] : undefined;
+}
+
+function pares(obj: Dados, campos: [string, string][]): Dados[] {
+  return campos.map(([titulo, campo]) => ({
+    Campo: titulo,
+    Valor: texto(obj?.[campo])
+  }));
+}
+
+async function snap(prisma: PrismaClient, id: string) {
+  const [avaliacao, s] = await Promise.all([
+    prisma.avaliacao.findUnique({
+      where: { id },
+      select: { id: true, status: true, snapshotHash: true }
+    }),
+    getLatestSnapshot(prisma, id)
+  ]);
+
+  if (!avaliacao) throw new Error('AVALIACAO_NOT_FOUND');
+  if (!s) throw new Error('SNAPSHOT_REQUIRED_BEFORE_EMISSION');
+  if (avaliacao.status !== 'PRONTA_PARA_EMISSAO') {
+    throw new Error('AVALIACAO_NAO_PRONTA_PARA_EMISSAO');
+  }
+  if (!avaliacao.snapshotHash || avaliacao.snapshotHash !== s.hashSha256) {
+    throw new Error('SNAPSHOT_NAO_VINCULADO_AO_ESTADO_ATUAL');
+  }
+
+  const readiness = await new RuleEngine(prisma).auditarAvaliacao(id, {
+    exigirSnapshot: true
+  });
+
+  if (!readiness.podeEmitir) {
+    throw new Error(
+      `AVALIACAO_NAO_APTA_PARA_EMISSAO:${JSON.stringify(readiness.alertas)}`
+    );
+  }
+
+  return { s, data: JSON.parse(s.dadosJson) as Dados };
+}
+
+async function saveDocument(
+  prisma: PrismaClient,
+  id: string,
+  formato: 'PDF' | 'DOCX' | 'XLSX',
+  tipo: 'LAUDO' | 'PLANILHA',
+  buffer: Buffer
+) {
+  const extensao = formato.toLowerCase();
+  const geracao = new Date().toISOString().replace(/[-:.TZ]/g, '');
+  const sufixo = crypto.randomBytes(12).toString('hex');
+  const nomeArquivo = `laudo-${id}-${geracao}-${sufixo}.${extensao}`;
+  const caminho = path.join(root, nomeArquivo);
+  const hashSha256 = crypto.createHash('sha256').update(buffer).digest('hex');
+
+  const resultado = await persistArtifactWithCompensation({
+    write: () => {
+      fs.writeFileSync(caminho, buffer, { flag: 'wx' });
+      return caminho;
+    },
+    persist: (arquivo: string) =>
+      prisma.$transaction(async (tx) => {
+        const criado = await tx.documento.create({
+          data: {
+            avaliacaoId: id,
+            tipo,
+            nomeArquivo,
+            caminho: arquivo,
+            formato,
+            hashSha256
+          }
+        });
+
+        await tx.auditoria.create({
+          data: {
+            avaliacaoId: id,
+            acao: 'GERACAO_DOCUMENTO',
+            entidade: 'Documento',
+            entidadeId: criado.id,
+            depoisJson: JSON.stringify({
+              formato,
+              tipo,
+              nomeArquivo,
+              caminho: arquivo,
+              hashSha256
+            }),
+            usuario: 'sistema',
+            motivo: 'Geração de documento do laudo'
+          }
+        });
+
+        return criado;
+      }),
+    remove: (arquivo: string) => fs.unlinkSync(arquivo)
+  });
+
+  return resultado.record.caminho;
+}
+
+function informacoesGerais(data: Dados): [string, string][] {
+  return [
+    ['Número da avaliação', 'numero'],
+    ['Título', 'titulo'],
+    ['Finalidade', 'finalidade'],
+    ['Tipo de imóvel', 'tipoImovel'],
+    ['Município', 'municipio'],
+    ['Estado', 'estado'],
+    ['Data da avaliação', 'dataAvaliacao'],
+    ['Responsável', 'responsavel'],
+    ['Status congelado', 'status'],
+    ['Versão do motor', 'versaoMotor'],
+    ['Hash dos parâmetros', 'parametrosHash']
+  ];
+}
+
+function camposImovel(imovel: Dados): [string, string][] {
+  return [
+    ['Matrícula', 'matricula'],
+    ['Cadastro imobiliário', 'cadastroImobiliario'],
+    ['Logradouro', 'logradouro'],
+    ['Número', 'numero'],
+    ['Complemento', 'complemento'],
+    ['Bairro', 'bairro'],
+    ['CEP', 'cep'],
+    ['Área do terreno (m²)', 'areaTerreno'],
+    ['Testada principal (m)', 'testadaPrincipal'],
+    ['Profundidade informada (m)', 'profundidadeInformada'],
+    ['Profundidade calculada (m)', 'profundidadeCalculada'],
+    ['Profundidade utilizada (m)', 'profundidadeUtilizada'],
+    ['Situação da quadra', 'situacaoQuadra'],
+    ['Distância do centro', 'distanciaCentro'],
+    ['Área edificada privativa (m²)', 'areaEdificadaPrivativa'],
+    ['Área edificada total (m²)', 'areaEdificadaTotal'],
+    ['Padrão construtivo', 'padrao'],
+    ['Estado de conservação', 'conservacao'],
+    ['Idade (anos)', 'idade'],
+    ['Vida útil', 'vidaUtil'],
+    ['Possui elevador', 'elevador'],
+    ['Número de vagas', 'numeroVagas'],
+    ['Tipo de vaga', 'tipoVaga'],
+    ['Valor total informado', 'valorTotal'],
+    ['Observações', 'observacoes']
+  ];
+}
+
+function linhasAmostras(data: Dados): Dados[] {
+  const homs = lista(data.homogeneizacoes);
+  const amostras = lista(data.amostras);
+
+  return amostras.map((a, i) => {
+    const h = homs.find((x) => x.amostraId === a.id);
+    return {
+      Ordem: i + 1,
+      Identificador: texto(a.identificador),
+      Fonte: texto(a.fonte),
+      URL: texto(a.url),
+      DataColeta: dataBR(a.dataColeta),
+      TipoFonte: texto(a.tipoFonte),
+      Bairro: texto(a.bairro),
+      SituacaoQuadra: texto(a.situacaoQuadra),
+      AreaTerreno_m2: a.areaTerreno ?? null,
+      Testada_m: a.testada ?? null,
+      Profundidade_m: a.profundidade ?? null,
+      AreaEdificada_m2: a.areaEdificada ?? null,
+      AreaPrivativa_m2: a.areaPrivativa ?? null,
+      Padrao: texto(a.padrao),
+      Conservacao: texto(a.conservacao),
+      Idade: a.idade ?? null,
+      VidaUtil: a.vidaUtil ?? null,
+      Elevador: texto(a.elevador),
+      Vagas: a.numeroVagas ?? null,
+      DistanciaCentro: a.distanciaCentro ?? null,
+      ValorOferta: a.valorOferta ?? null,
+      ValorTransacao: a.valorTransacao ?? null,
+      TipoValor: texto(a.tipoValor),
+      Status: texto(a.status),
+      Observacoes: texto(a.observacoes),
+      ValorUnitarioOriginal: h?.valorUnitarioOriginal ?? null,
+      ValorUnitarioHomogeneizado: h?.valorUnitarioHomogeneizado ?? null
+    };
+  });
+}
+
+function linhasHomogeneizacao(data: Dados): Dados[] {
+  const amostras = lista(data.amostras);
+
+  return lista(data.homogeneizacoes).map((h, i) => {
+    const a = amostras.find((x) => x.id === h.amostraId);
+    return {
+      Ordem: i + 1,
+      Amostra: texto(a?.identificador ?? h.amostraId),
+      Bairro: texto(a?.bairro),
+      ValorUnitarioOriginal: h.valorUnitarioOriginal,
+      FA: h.fa,
+      FT: h.ft,
+      FP: h.fp,
+      FO: h.fo,
+      FE: h.fe,
+      FI: h.fi,
+      FPC: h.fpc,
+      FC: h.fc,
+      FELEV: h.felev,
+      FG: h.fg,
+      ProdutoFatores: h.produtoFatores,
+      ValorUnitarioHomogeneizado: h.valorUnitarioHomogeneizado,
+      MotorVersao: texto(h.motorVersao),
+      ParametrosHash: texto(h.parametrosHash),
+      CalculadoEm: dataBR(h.calculadoEm),
+      AuditoriaCalculo: texto(h.auditoriaJson)
+    };
+  });
+}
+
+function linhasResultado(data: Dados): Dados[] {
+  const r = resultadoAtual(data);
+  if (!r) return [{ Campo: 'Resultado', Valor: 'Não emitido no snapshot' }];
+
+  return [
+    { Campo: 'Método', Valor: texto(r.metodo) },
+    { Campo: 'Número de amostras', Valor: texto(r.numeroAmostras) },
+    { Campo: 'Valor unitário', Valor: moeda(r.valorUnitario) },
+    { Campo: 'Área de referência (m²)', Valor: decimal(r.areaReferencia) },
+    { Campo: 'Valor total', Valor: moeda(r.valorTotal) },
+    { Campo: 'Média', Valor: moeda(r.media) },
+    { Campo: 'Mediana', Valor: moeda(r.mediana) },
+    { Campo: 'Desvio padrão', Valor: decimal(r.desvioPadrao, 4) },
+    { Campo: 'Coeficiente de variação', Valor: decimal(r.coeficienteVariacao, 4) },
+    { Campo: 'Erro padrão', Valor: decimal(r.erroPadrao, 4) },
+    { Campo: 'Data do resultado', Valor: dataBR(r.createdAt) }
+  ];
+}
+
+function linhasSaneamento(data: Dados): Dados[] {
+  const s = data.saneamento;
+  if (!s) return [{ Campo: 'Saneamento', Valor: 'Não registrado no snapshot' }];
+
+  return [
+    { Campo: 'Método', Valor: texto(s.metodo) },
+    { Campo: 'Média', Valor: decimal(s.media, 4) },
+    { Campo: 'Mediana', Valor: decimal(s.mediana, 4) },
+    { Campo: 'Desvio padrão', Valor: decimal(s.desvioPadrao, 4) },
+    { Campo: 'Limite inferior', Valor: decimal(s.limiteInferior, 4) },
+    { Campo: 'Limite superior', Valor: decimal(s.limiteSuperior, 4) },
+    { Campo: 'Critério de Chauvenet', Valor: texto(s.criterioChauvenet) },
+    { Campo: 'Critério de 30%', Valor: texto(s.criterio30) },
+    { Campo: 'Outliers registrados (JSON)', Valor: texto(s.outliersJson) },
+    { Campo: 'Data de execução', Valor: dataBR(s.executadoEm) }
+  ];
+}
+
+function adicionarSecaoPDF(
+  doc: PDFKit.PDFDocument,
+  titulo: string,
+  linhas: string[]
+) {
+  doc.moveDown(0.8);
+  doc.font('Helvetica-Bold').fontSize(13).text(titulo);
+  doc.moveDown(0.25);
+  doc.font('Helvetica').fontSize(9);
+
+  for (const linha of linhas) {
+    doc.text(linha, { width: 510, lineGap: 2 });
+  }
+}
+
+function paragrafo(t: string, negrito = false) {
+  return new Paragraph({
+    children: [new TextRun({ text: t, bold: negrito, size: 20 })],
+    spacing: { after: 100 }
+  });
+}
+
+function secoesDocumento(data: Dados, hash: string): Paragraph[] {
+  const imovel = data.imovelAvaliando ?? {};
+  const r = resultadoAtual(data);
+  const amostras = lista(data.amostras);
+  const homs = lista(data.homogeneizacoes);
+  const saneamento = linhasSaneamento(data);
+
+  const p: Paragraph[] = [
+    paragrafo('LAUDO DE AVALIAÇÃO IMOBILIÁRIA', true),
+    paragrafo('1. IDENTIFICAÇÃO DA AVALIAÇÃO', true)
+  ];
+
+  for (const [titulo, campo] of informacoesGerais(data)) {
+    const valor = campo === 'dataAvaliacao'
+      ? dataBR(data[campo])
+      : texto(data[campo]);
+    p.push(paragrafo(`${titulo}: ${valor}`));
+  }
+
+  p.push(paragrafo('2. IDENTIFICAÇÃO E CARACTERIZAÇÃO DO IMÓVEL', true));
+  for (const [titulo, campo] of camposImovel(imovel)) {
+    const v = imovel[campo];
+    const valor = ['valorTotal'].includes(campo) ? moeda(v) : texto(v);
+    p.push(paragrafo(`${titulo}: ${valor}`));
+  }
+
+  p.push(paragrafo('3. PESQUISA DE MERCADO E AMOSTRAS', true));
+  p.push(paragrafo(`Quantidade de amostras no snapshot: ${amostras.length}`));
+
+  for (let i = 0; i < amostras.length; i++) {
+    const a = amostras[i];
+    p.push(paragrafo(`Amostra ${i + 1}: ${texto(a.identificador)}`, true));
+    p.push(paragrafo(`Fonte: ${texto(a.fonte)} | URL: ${texto(a.url)}`));
+    p.push(paragrafo(`Coleta: ${dataBR(a.dataColeta)} | Status: ${texto(a.status)}`));
+    p.push(paragrafo(`Bairro: ${texto(a.bairro)} | Situação: ${texto(a.situacaoQuadra)}`));
+    p.push(paragrafo(`Área do terreno: ${decimal(a.areaTerreno)} m² | Testada: ${decimal(a.testada)} m | Profundidade: ${decimal(a.profundidade)} m`));
+    p.push(paragrafo(`Valor de oferta: ${moeda(a.valorOferta)} | Valor de transação: ${moeda(a.valorTransacao)} | Tipo: ${texto(a.tipoValor)}`));
+    p.push(paragrafo(`Observações: ${texto(a.observacoes)}`));
+  }
+
+  p.push(paragrafo('4. HOMOGENEIZAÇÃO', true));
+  p.push(paragrafo(`Registros de homogeneização no snapshot: ${homs.length}`));
+
+  for (const h of homs) {
+    const a = amostras.find((x) => x.id === h.amostraId);
+    p.push(paragrafo(`Amostra: ${texto(a?.identificador ?? h.amostraId)}`, true));
+    p.push(paragrafo(`Valor unitário original: ${moeda(h.valorUnitarioOriginal)} | Valor unitário homogeneizado: ${moeda(h.valorUnitarioHomogeneizado)}`));
+    p.push(paragrafo(`FA=${texto(h.fa)}; FT=${texto(h.ft)}; FP=${texto(h.fp)}; FO=${texto(h.fo)}; FE=${texto(h.fe)}; FI=${texto(h.fi)}`));
+    p.push(paragrafo(`FPC=${texto(h.fpc)}; FC=${texto(h.fc)}; FELEV=${texto(h.felev)}; FG=${texto(h.fg)}; Produto=${texto(h.produtoFatores)}`));
+    p.push(paragrafo(`Versão do motor: ${texto(h.motorVersao)} | Hash dos parâmetros: ${texto(h.parametrosHash)}`));
+    if (h.auditoriaJson) p.push(paragrafo(`Auditoria do cálculo: ${texto(h.auditoriaJson)}`));
+  }
+
+  p.push(paragrafo('5. SANEAMENTO DA AMOSTRA', true));
+  for (const linha of saneamento) {
+    p.push(paragrafo(`${linha.Campo}: ${linha.Valor}`));
+  }
+
+  p.push(paragrafo('6. RESULTADO E ESTATÍSTICA', true));
+  if (r) {
+    p.push(paragrafo(`Método: ${texto(r.metodo)}`));
+    p.push(paragrafo(`Número de amostras: ${texto(r.numeroAmostras)}`));
+    p.push(paragrafo(`Valor unitário: ${moeda(r.valorUnitario)}`));
+    p.push(paragrafo(`Área de referência: ${decimal(r.areaReferencia)} m²`));
+    p.push(paragrafo(`Valor total estimado: ${moeda(r.valorTotal)}`, true));
+    p.push(paragrafo(`Média: ${moeda(r.media)} | Mediana: ${moeda(r.mediana)}`));
+    p.push(paragrafo(`Desvio padrão: ${decimal(r.desvioPadrao, 4)} | Coeficiente de variação: ${decimal(r.coeficienteVariacao, 4)} | Erro padrão: ${decimal(r.erroPadrao, 4)}`));
+  } else {
+    p.push(paragrafo('Não há resultado registrado no snapshot.'));
+  }
+
+  p.push(paragrafo('7. CONTROLE, INTEGRIDADE E RASTREABILIDADE', true));
+  p.push(paragrafo(`Identificador da avaliação: ${texto(data.id)}`));
+  p.push(paragrafo(`Snapshot SHA-256: ${hash}`));
+  p.push(paragrafo(`Data de geração: ${new Date().toLocaleString('pt-BR')}`));
+  p.push(paragrafo('Este documento apresenta os dados disponíveis no snapshot congelado da avaliação. Campos ausentes não foram estimados ou preenchidos artificialmente.'));
+  p.push(paragrafo('A emissão não substitui a revisão técnica, a validação documental nem a responsabilidade do profissional habilitado.'));
+
+  return p;
+}
+
+export class ReportService {
+  static async pdf(prisma: PrismaClient, id: string) {
+    const { s, data } = await snap(prisma, id);
+
+    return new Promise<string>((resolve, reject) => {
+      const chunks: Buffer[] = [];
+      const d = new PDFDocument({
+        size: 'A4',
+        margins: { top: 45, bottom: 45, left: 45, right: 45 },
+        bufferPages: true,
+        info: {
+          Title: `Laudo de Avaliação ${texto(data.numero)}`,
+          Author: texto(data.responsavel),
+          Subject: 'Laudo de avaliação imobiliária'
+        }
+      });
+
+      d.on('data', (chunk: Buffer) => chunks.push(chunk));
+      d.on('error', reject);
+
+      d.on('end', async () => {
+        try {
+          const buffer = Buffer.concat(chunks);
+          d.removeAllListeners();
+          const caminho = await saveDocument(prisma, id, 'PDF', 'LAUDO', buffer);
+          resolve(caminho);
+        } catch (error) {
+          reject(error);
+        }
+      });
+
+      d.font('Helvetica-Bold').fontSize(18)
+        .text('LAUDO DE AVALIAÇÃO IMOBILIÁRIA', { align: 'center' });
+      d.moveDown();
+      d.font('Helvetica').fontSize(9)
+        .text(`Avaliação: ${texto(data.numero)} — ${texto(data.titulo)}`);
+      d.text(`Município: ${texto(data.municipio)}/${texto(data.estado)}`);
+      d.text(`Responsável: ${texto(data.responsavel)}`);
+      d.text(`Data da avaliação: ${dataBR(data.dataAvaliacao)}`);
+
+      adicionarSecaoPDF(d, '1. Identificação da avaliação',
+        informacoesGerais(data).map(([titulo, campo]) =>
+          `${titulo}: ${campo === 'dataAvaliacao' ? dataBR(data[campo]) : texto(data[campo])}`
+        ));
+
+      const imovel = data.imovelAvaliando ?? {};
+      adicionarSecaoPDF(d, '2. Caracterização do imóvel',
+        camposImovel(imovel).map(([titulo, campo]) => {
+          const v = imovel[campo];
+          return `${titulo}: ${campo === 'valorTotal' ? moeda(v) : texto(v)}`;
+        }));
+
+      const amostras = lista(data.amostras);
+      adicionarSecaoPDF(d, '3. Pesquisa de mercado e amostras', [
+        `Total de amostras registradas: ${amostras.length}`,
+        ...amostras.flatMap((a, i) => [
+          `Amostra ${i + 1}: ${texto(a.identificador)} | Fonte: ${texto(a.fonte)} | URL: ${texto(a.url)}`,
+          `Coleta: ${dataBR(a.dataColeta)} | Bairro: ${texto(a.bairro)} | Status: ${texto(a.status)}`,
+          `Terreno: ${decimal(a.areaTerreno)} m² | Testada: ${decimal(a.testada)} m | Profundidade: ${decimal(a.profundidade)} m`,
+          `Oferta: ${moeda(a.valorOferta)} | Transação: ${moeda(a.valorTransacao)} | Tipo: ${texto(a.tipoValor)}`,
+          `Observações: ${texto(a.observacoes)}`
+        ])
+      ]);
+
+      const homs = lista(data.homogeneizacoes);
+      adicionarSecaoPDF(d, '4. Homogeneização', [
+        `Registros de homogeneização: ${homs.length}`,
+        ...homs.flatMap((h) => [
+          `Amostra: ${texto(h.amostraId)} | VU original: ${moeda(h.valorUnitarioOriginal)} | VU homogeneizado: ${moeda(h.valorUnitarioHomogeneizado)}`,
+          `FA=${texto(h.fa)} | FT=${texto(h.ft)} | FP=${texto(h.fp)} | FO=${texto(h.fo)} | FE=${texto(h.fe)} | FI=${texto(h.fi)}`,
+          `FPC=${texto(h.fpc)} | FC=${texto(h.fc)} | FELEV=${texto(h.felev)} | FG=${texto(h.fg)} | Produto=${texto(h.produtoFatores)}`,
+          `Motor: ${texto(h.motorVersao)} | Hash dos parâmetros: ${texto(h.parametrosHash)}`
+        ])
+      ]);
+
+      adicionarSecaoPDF(d, '5. Saneamento',
+        linhasSaneamento(data).map((x) => `${x.Campo}: ${x.Valor}`));
+
+      const r = resultadoAtual(data);
+      adicionarSecaoPDF(d, '6. Resultado e estatística', r ? [
+        `Método: ${texto(r.metodo)}`,
+        `Número de amostras: ${texto(r.numeroAmostras)}`,
+        `Valor unitário: ${moeda(r.valorUnitario)}`,
+        `Área de referência: ${decimal(r.areaReferencia)} m²`,
+        `VALOR TOTAL ESTIMADO: ${moeda(r.valorTotal)}`,
+        `Média: ${moeda(r.media)} | Mediana: ${moeda(r.mediana)}`,
+        `Desvio padrão: ${decimal(r.desvioPadrao, 4)}`,
+        `Coeficiente de variação: ${decimal(r.coeficienteVariacao, 4)}`,
+        `Erro padrão: ${decimal(r.erroPadrao, 4)}`
+      ] : ['Não há resultado registrado no snapshot.']);
+
+      adicionarSecaoPDF(d, '7. Controle e rastreabilidade', [
+        `ID da avaliação: ${texto(data.id)}`,
+        `Snapshot SHA-256: ${s.hashSha256}`,
+        `Data de geração: ${new Date().toLocaleString('pt-BR')}`,
+        'Os dados apresentados correspondem ao snapshot congelado.',
+        'Campos ausentes não foram estimados nem preenchidos artificialmente.',
+        'A emissão não substitui a revisão técnica e a responsabilidade profissional.'
+      ]);
+
+      d.end();
+    });
+  }
+
+  static async docx(prisma: PrismaClient, id: string) {
+    const { s, data } = await snap(prisma, id);
+    const doc = new Document({
+      creator: texto(data.responsavel),
+      title: `Laudo de Avaliação ${texto(data.numero)}`,
+      description: 'Laudo de avaliação imobiliária baseado em snapshot congelado',
+      sections: [{
+        properties: {},
+        children: secoesDocumento(data, s.hashSha256)
+      }]
+    });
+
+    const buffer = await Packer.toBuffer(doc);
+    return saveDocument(prisma, id, 'DOCX', 'LAUDO', buffer);
+  }
+
+  static async xlsx(prisma: PrismaClient, id: string) {
+    const { s, data } = await snap(prisma, id);
+    const wb = XLSX.utils.book_new();
+    const imovel = data.imovelAvaliando ?? {};
+    const r = resultadoAtual(data);
+
+    const identificacao = pares(data, informacoesGerais(data));
+    identificacao.push(
+      { Campo: 'Snapshot SHA-256', Valor: s.hashSha256 },
+      { Campo: 'Snapshot versão', Valor: s.versao },
+      { Campo: 'Snapshot criado em', Valor: dataBR(s.createdAt) },
+      { Campo: 'Data de geração da planilha', Valor: new Date().toLocaleString('pt-BR') }
+    );
+
+    XLSX.utils.book_append_sheet(
+      wb, XLSX.utils.json_to_sheet(identificacao), 'Identificacao'
+    );
+
+    XLSX.utils.book_append_sheet(
+      wb,
+      XLSX.utils.json_to_sheet(pares(imovel, camposImovel(imovel))),
+      'Imovel'
+    );
+
+    const amostras = linhasAmostras(data);
+    XLSX.utils.book_append_sheet(
+      wb,
+      XLSX.utils.json_to_sheet(amostras.length ? amostras : [{ Observacao: 'Nenhuma amostra no snapshot' }]),
+      'Amostras'
+    );
+
+    const homogeneizacoes = linhasHomogeneizacao(data);
+    XLSX.utils.book_append_sheet(
+      wb,
+      XLSX.utils.json_to_sheet(homogeneizacoes.length ? homogeneizacoes : [{ Observacao: 'Nenhuma homogeneização no snapshot' }]),
+      'Homogeneizacao'
+    );
+
+    XLSX.utils.book_append_sheet(
+      wb, XLSX.utils.json_to_sheet(linhasSaneamento(data)), 'Saneamento'
+    );
+
+    XLSX.utils.book_append_sheet(
+      wb, XLSX.utils.json_to_sheet(linhasResultado(data)), 'Resultado'
+    );
+
+    const controle = [
+      { Campo: 'ID da avaliação', Valor: texto(data.id) },
+      { Campo: 'Número', Valor: texto(data.numero) },
+      { Campo: 'Status do snapshot', Valor: texto(data.status) },
+      { Campo: 'Snapshot SHA-256', Valor: s.hashSha256 },
+      { Campo: 'Versão do snapshot', Valor: s.versao },
+      { Campo: 'Snapshot criado em', Valor: dataBR(s.createdAt) },
+      { Campo: 'Versão do motor', Valor: texto(data.versaoMotor) },
+      { Campo: 'Hash dos parâmetros', Valor: texto(data.parametrosHash) },
+      { Campo: 'Quantidade de amostras', Valor: lista(data.amostras).length },
+      { Campo: 'Quantidade de homogeneizações', Valor: lista(data.homogeneizacoes).length },
+      { Campo: 'Resultado presente', Valor: r ? 'Sim' : 'Não' },
+      { Campo: 'Documento baseado em', Valor: 'Snapshot congelado' }
+    ];
+
+    XLSX.utils.book_append_sheet(
+      wb, XLSX.utils.json_to_sheet(controle), 'Controle'
+    );
+
+    for (const nome of wb.SheetNames) {
+      const ws = wb.Sheets[nome];
+      const range = XLSX.utils.decode_range(ws['!ref'] ?? 'A1:A1');
+      ws['!cols'] = Array.from(
+        { length: range.e.c + 1 },
+        (_, c) => {
+          let max = 14;
+          for (let row = range.s.r; row <= range.e.r; row++) {
+            const cell = ws[XLSX.utils.encode_cell({ r: row, c })];
+            if (cell?.v !== undefined) {
+              max = Math.max(max, String(cell.v).length + 2);
+            }
+          }
+          return { wch: Math.min(max, 55) };
+        }
+      );
+      ws['!autofilter'] = { ref: ws['!ref'] ?? 'A1:A1' };
+    }
+
+    const buffer = XLSX.write(wb, {
+      type: 'buffer',
+      bookType: 'xlsx'
+    }) as Buffer;
+
+    return saveDocument(prisma, id, 'XLSX', 'PLANILHA', buffer);
+  }
+
+  static async generateAll(prisma: PrismaClient, id: string) {
+    const pdf = await ReportService.pdf(prisma, id);
+    const docx = await ReportService.docx(prisma, id);
+    const xlsx = await ReportService.xlsx(prisma, id);
+    return { pdf, docx, xlsx };
+  }
+}
