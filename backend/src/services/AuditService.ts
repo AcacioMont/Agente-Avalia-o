@@ -1,0 +1,2 @@
+import {PrismaClient} from '@prisma/client';
+export async function audit(prisma:PrismaClient,args:{avaliacaoId:string,acao:string,entidade:string,entidadeId?:string,antes?:unknown,depois?:unknown,usuario?:string,motivo?:string}){return prisma.auditoria.create({data:{avaliacaoId:args.avaliacaoId,acao:args.acao,entidade:args.entidade,entidadeId:args.entidadeId,antesJson:args.antes?JSON.stringify(args.antes):undefined,depoisJson:args.depois?JSON.stringify(args.depois):undefined,usuario:args.usuario??'sistema',motivo:args.motivo}})}

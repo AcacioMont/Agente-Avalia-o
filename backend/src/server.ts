@@ -1,0 +1,1 @@
+import 'dotenv/config';import {createApp} from './app.js';import {PrismaClient} from '@prisma/client';const port=Number(process.env.PORT??3000);const prisma=new PrismaClient();const app=createApp(prisma);app.listen(port,()=>console.log(`RoboAvaliador em http://localhost:${port}`));

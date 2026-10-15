@@ -1,0 +1,15 @@
+{
+  "base": "_COLETA_ROBO_AVALIADOR_20261005_073240.zip",
+  "date": "2026-10-05",
+  "changed_files": [
+    "backend/src/services/SnapshotService.ts",
+    "backend/src/services/ReportService.ts",
+    "backend/src/engines/RuleEngine.ts",
+    "backend/src/engines/CalculationEngine.ts",
+    "backend/src/routes/avaliacao.routes.ts",
+    "backend/prisma/schema.prisma",
+    "backend/tests/ReportService.contract.test.ts"
+  ],
+  "notes": "Snapshot v2, integrity/governance improvements, report/ABNT structure improvements, formal exclusions/parameters in report, schema uniqueness, encoding cleanup.",
+  "runtime_validation": "Existing base collection reported backend build success and 39/39 tests. Post-change runtime build could not be executed in this environment because dependencies/node_modules are absent."
+}

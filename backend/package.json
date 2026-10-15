@@ -1,0 +1,39 @@
+{
+  "name": "roboavaliador-backend",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/server.ts",
+    "build": "tsc",
+    "start": "node dist/src/server.js",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "prisma:generate": "prisma generate",
+    "db:push": "prisma db push",
+    "db:seed": "tsx prisma/seed.ts",
+    "db:clean": "tsx prisma/clean.ts"
+  },
+  "prisma": {
+    "seed": "tsx prisma/seed.ts"
+  },
+  "dependencies": {
+    "@prisma/client": "^6.16.0",
+    "big.js": "^7.0.1",
+    "docx": "^9.5.1",
+    "express": "^5.1.0",
+    "helmet": "^8.1.0",
+    "pdfkit": "^0.17.1",
+    "xlsx": "^0.18.5",
+    "dotenv": "^16.5.0"
+  },
+  "devDependencies": {
+    "@types/big.js": "^6.2.2",
+    "@types/express": "^5.0.3",
+    "@types/node": "^22.15.30",
+    "@types/pdfkit": "^0.13.9",
+    "prisma": "^6.16.0",
+    "tsx": "^4.19.4",
+    "typescript": "^5.8.3",
+    "vitest": "^3.2.4"
+  }
+}

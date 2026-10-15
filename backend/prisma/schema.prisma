@@ -1,0 +1,273 @@
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+model Avaliacao {
+  id              String   @id @default(uuid())
+  numero          String   @unique
+  titulo          String
+  finalidade      String
+  tipoImovel      String
+  municipio       String
+  estado          String
+  dataAvaliacao   DateTime
+  responsavel     String
+  status          String   @default("EM_ELABORACAO")
+  versaoMotor     String?
+  parametrosHash  String?
+  snapshotHash    String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  imovelAvaliando  ImovelAvaliando?
+  amostras         Amostra[]
+  homogeneizacoes  Homogeneizacao[]
+  saneamento       Saneamento?
+  exclusoes        Exclusao[]
+  resultados       Resultado[]
+  historicos       Historico[]
+  documentos       Documento[]
+  fotografias      Fotografia[]
+  snapshots        Snapshot[]
+  auditorias       Auditoria[]
+}
+
+model ImovelAvaliando {
+  id                     String   @id @default(uuid())
+  avaliacaoId            String   @unique
+  avaliacao              Avaliacao @relation(fields: [avaliacaoId], references: [id], onDelete: Cascade)
+  matricula              String?
+  cadastroImobiliario    String?
+  bairro                 String
+  logradouro             String
+  numero                 String?
+  complemento            String?
+  cep                    String?
+  areaTerreno            Float
+  testadaPrincipal       Float
+  profundidadeInformada  Float?
+  profundidadeCalculada  Float?
+  profundidadeUtilizada  Float
+  situacaoQuadra         String
+  distanciaCentro       Float
+  areaEdificadaPrivativa Float?
+  areaEdificadaTotal     Float?
+  padrao                 String?
+  conservacao            String?
+  idade                  Float?
+  vidaUtil               Float?
+  elevador               Boolean @default(false)
+  numeroVagas            Float   @default(0)
+  tipoVaga               String?
+  valorTotal             Float?
+  observacoes            String?
+}
+
+model Amostra {
+  id                String   @id @default(uuid())
+  avaliacaoId       String
+  avaliacao         Avaliacao @relation(fields: [avaliacaoId], references: [id], onDelete: Cascade)
+  identificador     String?
+  fonte             String
+  url               String?
+  dataColeta        DateTime
+  tipoFonte         String
+  bairro            String
+  situacaoQuadra    String
+  areaTerreno       Float
+  testada           Float
+  profundidade      Float
+  areaEdificada     Float?
+  areaPrivativa     Float?
+  padrao            String?
+  conservacao       String?
+  idade             Float?
+  vidaUtil          Float?
+  elevador          Boolean @default(false)
+  numeroVagas       Float   @default(0)
+  distanciaCentro   Float
+  valorOferta       Float?
+  valorTransacao    Float?
+  tipoValor         String
+  status             String   @default("ATIVA")
+  observacoes       String?
+
+  homogeneizacao Homogeneizacao?
+  exclusao       Exclusao?
+
+  @@index([avaliacaoId])
+  @@index([status])
+}
+
+model Fator {
+  id          String   @id @default(uuid())
+  codigo      String   @unique
+  nome        String
+  descricao   String?
+  formula     String?
+  ativo       Boolean  @default(true)
+  ordem       Int
+  parametros  ParametroFator[]
+}
+
+model ParametroFator {
+  id             String   @id @default(uuid())
+  fatorId        String
+  fator          Fator    @relation(fields: [fatorId], references: [id], onDelete: Cascade)
+  chave          String
+  valor          Float
+  unidade        String?
+  justificativa  String?
+  ativo          Boolean  @default(true)
+
+  @@unique([fatorId, chave])
+}
+
+model Homogeneizacao {
+  id                       String   @id @default(uuid())
+  avaliacaoId              String
+  avaliacao                Avaliacao @relation(fields: [avaliacaoId], references: [id], onDelete: Cascade)
+  amostraId                String   @unique
+  amostra                  Amostra  @relation(fields: [amostraId], references: [id], onDelete: Cascade)
+  valorUnitarioOriginal    Float
+  fa                       Float
+  ft                       Float
+  fp                       Float
+  fo                       Float
+  fe                       Float
+  fi                       Float
+  fpc                      Float
+  fc                       Float
+  felev                    Float
+  fg                       Float
+  produtoFatores           Float
+  valorUnitarioHomogeneizado Float
+  motorVersao              String?
+  parametrosHash           String?
+  auditoriaJson            String?
+  calculadoEm              DateTime @default(now())
+}
+
+model Saneamento {
+  id                String   @id @default(uuid())
+  avaliacaoId       String   @unique
+  avaliacao         Avaliacao @relation(fields: [avaliacaoId], references: [id], onDelete: Cascade)
+  metodo            String
+  media             Float
+  mediana           Float
+  desvioPadrao      Float
+  limiteInferior    Float
+  limiteSuperior    Float
+  criterioChauvenet       Boolean  @default(false)
+  criterio30              Boolean  @default(true)
+  outliersJson            String
+  outliersChauvenetJson   String   @default("[]")
+  decisaoChauvenet        String?
+  justificativaChauvenet String?
+  decisaoChauvenetPor     String?
+  decisaoChauvenetEm     DateTime?
+  executadoEm             DateTime @default(now())
+}
+
+model Exclusao {
+  id            String   @id @default(uuid())
+  avaliacaoId   String
+  avaliacao     Avaliacao @relation(fields: [avaliacaoId], references: [id], onDelete: Cascade)
+  amostraId     String   @unique
+  amostra       Amostra  @relation(fields: [amostraId], references: [id], onDelete: Cascade)
+  criterio      String
+  motivo        String
+  valor         Float
+  usuario       String
+  dataExclusao  DateTime @default(now())
+}
+
+model Resultado {
+  id                 String   @id @default(uuid())
+  avaliacaoId        String   @unique
+  avaliacao          Avaliacao @relation(fields: [avaliacaoId], references: [id], onDelete: Cascade)
+  metodo             String
+  numeroAmostras     Int
+  valorUnitario      Float
+  areaReferencia     Float
+  valorTotal         Float
+  media              Float
+  mediana            Float
+  desvioPadrao       Float
+  coeficienteVariacao Float
+  erroPadrao         Float
+  createdAt          DateTime @default(now())
+}
+
+model Historico {
+  id              String   @id @default(uuid())
+  avaliacaoId     String
+  avaliacao       Avaliacao @relation(fields: [avaliacaoId], references: [id], onDelete: Cascade)
+  entidade        String
+  entidadeId      String
+  campo           String
+  valorAnterior   String?
+  valorNovo       String?
+  usuario         String
+  dataAlteracao   DateTime @default(now())
+  motivo          String?
+}
+
+model Documento {
+  id            String   @id @default(uuid())
+  avaliacaoId   String
+  avaliacao     Avaliacao @relation(fields: [avaliacaoId], references: [id], onDelete: Cascade)
+  tipo          String
+  nomeArquivo   String
+  caminho       String
+  formato       String
+  dataGeracao   DateTime @default(now())
+  hashSha256    String?
+  snapshotHash  String?
+}
+
+model Fotografia {
+  id          String   @id @default(uuid())
+  avaliacaoId String
+  avaliacao   Avaliacao @relation(fields: [avaliacaoId], references: [id], onDelete: Cascade)
+  amostraId   String?
+  arquivo     String
+  descricao   String?
+  dataFoto    DateTime
+  ordem       Int
+}
+
+model Snapshot {
+  id          String   @id @default(uuid())
+  avaliacaoId String
+  avaliacao   Avaliacao @relation(fields: [avaliacaoId], references: [id], onDelete: Cascade)
+  versao      Int
+  dadosJson   String
+  hashSha256  String
+  createdAt   DateTime @default(now())
+
+  @@unique([avaliacaoId, versao])
+  @@index([avaliacaoId, versao])
+}
+
+model Auditoria {
+  id          String   @id @default(uuid())
+  avaliacaoId String
+  avaliacao   Avaliacao @relation(fields: [avaliacaoId], references: [id], onDelete: Cascade)
+  acao        String
+  entidade    String
+  entidadeId  String?
+  antesJson   String?
+  depoisJson  String?
+  usuario     String
+  dataHora    DateTime @default(now())
+  motivo      String?
+
+  @@index([avaliacaoId, dataHora])
+}
+

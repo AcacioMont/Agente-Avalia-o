@@ -1,0 +1,7 @@
+﻿DATA: 2026-10-05 07:32:52
+POWERSHELL: 5.1.19041.6456
+OS: Microsoft Windows NT 10.0.19045.0
+PROJETO: C:\Users\Acacio.DESKTOP-SLKUN50\Desktop\RoboAvaliacao1\roboavaliador
+NODE: v24.19.0
+NPM: 11.17.0
+GIT: git version 2.53.0.windows.1

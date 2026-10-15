@@ -1,0 +1,4 @@
+import express from 'express';import helmet from 'helmet';import path from 'node:path';import {PrismaClient} from '@prisma/client';import {avaliacaoRoutes} from './routes/avaliacao.routes.js';import {exportRoutes} from './routes/export.routes.js';import {sistemaRoutes} from './routes/sistema.routes.js';
+export function createApp(prisma=new PrismaClient()){const app=express();app.use(helmet({contentSecurityPolicy:false}));app.use(express.json({limit:'10mb'}));app.get('/api/v1',(_q,res)=>res.json({name:'RoboAvaliador',version:process.env.MOTOR_VERSAO}));app.use('/api/v1/avaliacoes',avaliacaoRoutes(prisma));app.use('/api/v1/export',exportRoutes(prisma));app.use('/api/v1/sistema',sistemaRoutes(prisma));const front=path.resolve(process.cwd(),'../frontend/dist');app.use(express.static(front));app.get(/^(?!\/api\/).*/,(req,res,next)=>res.sendFile(path.join(front,'index.html'),err=>err&&next(err)));return app}
+
+
